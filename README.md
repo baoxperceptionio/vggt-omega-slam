@@ -1,142 +1,286 @@
-<div align="center">
-<h1>VGGT-&Omega;</h1>
+# VGGT-Omega Ground-Tracking SLAM
 
-<a href="http://vggt-omega.github.io/" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href="https://arxiv.org/abs/2605.15195" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/arXiv-2605.15195-b31b1b" alt="arXiv"></a>
-<a href="https://huggingface.co/spaces/facebook/vggt-omega"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
+This project is an experimental SLAM-style inference pipeline built on top of
+[VGGT-Omega](https://github.com/facebookresearch/vggt-omega). The original
+VGGT-Omega model remains the geometry engine: it predicts camera pose, depth,
+confidence, and point maps for a short ordered image sequence. This repository
+wraps that model with a ground-normalized sliding-window tracker so longer
+videos can be processed in one consistent, interpretable coordinate frame.
 
-<p>
-  <span class="author"><a href="https://jytime.github.io/">Jianyuan Wang</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://silent-chen.github.io/">Minghao Chen</a><sup>1</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=FUDsZkEAAAAJ&amp;hl=zh-CN">Shangzhan Zhang</a><sup>1</sup></span>
-  <span class="author"><a href="https://nikitakaraevv.github.io/">Nikita Karaev</a><sup>1</sup></span>
-  <br>
-  <span class="author"><a href="https://demuc.de/">Johannes Schönberger</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=IJidh-UAAAAJ&amp;hl=fr">Patrick Labatut</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=lJ_oh2EAAAAJ&amp;hl=en">Piotr Bojanowski</a><sup>2</sup></span>
-  <span class="author"><a href="https://d-novotny.github.io/">David Novotny</a></span>
-  <br>
-  <span class="author"><a href="https://www.robots.ox.ac.uk/~vedaldi/">Andrea Vedaldi</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://chrirupp.github.io/">Christian Rupprecht</a><sup>1</sup></span>
-</p>
+The current public runner is `scripts/run_incremental_slam.py`. Despite the
+historical filename, the supported mode is now ground-tracking sliding-window
+SLAM. The older append-only KV-cache mode and the plain sliding-window mode were
+removed from the command-line interface to avoid maintaining several coordinate
+systems at once.
 
-**<sup>1</sup>[Visual Geometry Group, University of Oxford](https://www.robots.ox.ac.uk/~vgg/)**; **<sup>2</sup>[Meta AI](https://ai.facebook.com/research/)**
-</div>
+## What Changed From VGGT-Omega
 
-## Pretrained models
+VGGT-Omega is normally a batch model: it receives a set or short sequence of
+images and predicts geometry in that sequence's local coordinate system. Each
+new window can have a different origin, orientation, and scale. This project
+does not retrain the released checkpoint. Instead, it changes the inference
+system around VGGT-Omega:
 
-Before using the models, please request access to the checkpoints [here](https://huggingface.co/facebook/VGGT-Omega). Once your request is approved, you can download the checkpoints. Please note that access requests are reviewed by an automated process based on the information provided in the request.
+- run VGGT-Omega repeatedly on overlapping windows;
+- estimate a ground plane from the first window;
+- rotate the first window so the estimated ground normal becomes global up;
+- scale the scene so the first camera-to-ground distance is `1`;
+- align later windows into that global frame with Sim(3);
+- add only sufficiently translated frames to the map and to the future window
+  anchor set.
 
-| Model | Resolution | Text alignment | Download |
-| :--- | :--- | :--- | :--- |
-| `VGGT-Omega-1B-512` | 512 | No | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_512.pt) |
-| `VGGT-Omega-1B-256-Text-Alignment` | 256 | Yes | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_256_text.pt) |
-
-The authors are not involved in the review process and cannot approve or reject individual applications. However, the [🤗 Hugging Face demo](https://huggingface.co/spaces/facebook/vggt-omega) is available to everyone.
-
-
-## Quick Start
-
-First, clone this repository and install the dependencies:
-
-```bash
-git clone git@github.com:facebookresearch/vggt-omega.git
-cd vggt-omega
-pip install -r requirements.txt
-pip install -e .
+```mermaid
+flowchart LR
+    A["Input images / video frames"] --> B["VGGT-Omega window inference"]
+    B --> C["Pose, depth, confidence, point map"]
+    C --> D["Ground-plane initialization"]
+    D --> E["Ground-normalized global frame"]
+    E --> F["Sliding-window tracking"]
+    F --> G["Sim(3) alignment from overlap cameras"]
+    G --> H{"Motion above threshold?"}
+    H -- "yes" --> I["Accept frame into map and future anchors"]
+    H -- "no" --> J["Save pose only"]
+    I --> K["PLY point cloud + NPZ predictions"]
+    J --> K
 ```
 
+## Model Adaptation
 
-Now, try the model with a few lines of code:
+The model itself is still `VGGTOmega`. The adaptation is a tracking wrapper,
+not a learned recurrent model:
 
-```python
-import torch
+```mermaid
+flowchart TB
+    subgraph Original["Original VGGT-Omega"]
+        O1["Images in one local window"] --> O2["Full-attention VGGT-Omega"]
+        O2 --> O3["Local camera extrinsics"]
+        O2 --> O4["Depth and confidence"]
+    end
 
-from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.load_fn import load_and_preprocess_images
-from vggt_omega.utils.pose_enc import encoding_to_camera
+    subgraph Wrapper["Ground-tracking wrapper in this repository"]
+        W1["Choose initial window"] --> W2["Estimate ground transform"]
+        W2 --> W3["Store global frame"]
+        W3 --> W4["For each candidate frame: run overlap window"]
+        W4 --> W5["Estimate global_from_window with Umeyama Sim(3)"]
+        W5 --> W6["Rebase extrinsics and points"]
+        W6 --> W7["Motion gate"]
+    end
 
-checkpoint_path = "path/to/vggt_omega_1b_512.pt"
-image_names = ["path/to/imageA.png", "path/to/imageB.png", "path/to/imageC.png"]
-
-model = VGGTOmega().to("cuda").eval()
-model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-
-images = load_and_preprocess_images(image_names, image_resolution=512).to("cuda")
-
-with torch.inference_mode():
-    predictions = model(images)
-
-extrinsics, intrinsics = encoding_to_camera(
-    predictions["pose_enc"],
-    predictions["images"].shape[-2:],
-)
-
-depth = predictions["depth"]
-depth_conf = predictions["depth_conf"]
-camera_and_register_tokens = predictions["camera_and_register_tokens"]
-camera_tokens = camera_and_register_tokens[:, :, :1]
-registers = camera_and_register_tokens[:, :, 1:]
+    O3 --> W2
+    O4 --> W2
+    O3 --> W5
+    O4 --> W6
 ```
 
-For the text-aligned checkpoint, use `VGGTOmega(enable_alignment=True)` with `image_resolution=256` and read `predictions["text_alignment_embedding"]`.
+Important consequences:
 
+- The released VGGT-Omega checkpoint can be used directly.
+- There is no learned temporal state, bundle adjustment, loop closure, or pose
+  graph optimization.
+- The output coordinate system is defined by the first window's estimated
+  ground plane, not by GPS, IMU, COLMAP, or a metric calibration target.
 
-## Interactive Demo
+## How Ground Is Estimated
 
-Install the demo dependencies:
+The first VGGT-Omega window initializes the global coordinate frame. The code
+uses the first frame's predicted point map and confidence map:
 
-```bash
-pip install -r requirements_demo.txt
+1. Select candidate ground points:
+   - keep finite points only;
+   - prefer points in the lower part of the image;
+   - prefer points with confidence at or above the median confidence;
+   - prefer points whose model-space vertical coordinate suggests they are
+     below the camera.
+2. Fit a coarse plane with SVD over those candidates.
+3. Compute the coarse camera-to-plane distance `d`.
+4. Run deterministic RANSAC with threshold `max(d / 10, 1e-4)`.
+5. Refit the plane with SVD on the RANSAC inliers.
+6. Orient the normal so it points upward relative to the candidate centroid.
+7. Rotate that normal onto the global up axis `[0, 1, 0]`.
+8. Scale the scene by `1 / d`, so the first camera is one normalized unit above
+   the estimated ground plane.
+
+The initial ground transform is therefore:
+
+```text
+global_point = scale * R_ground * local_point
+scale = 1 / camera_to_ground_distance
+R_ground * ground_normal = [0, 1, 0]
 ```
 
-Launch the Gradio demo with a local checkpoint path:
+This gives the tracker a practical normalized unit. With the default motion
+threshold of `0.1`, a frame is accepted after moving roughly one tenth of the
+first camera height above the estimated ground.
+
+## Window Alignment
+
+After initialization, each tracking step builds a window from the latest
+accepted frames plus one candidate frame:
+
+```text
+accepted anchors: 0 1 2 3
+candidate:        4
+window:           0 1 2 3 4
+```
+
+If frame `4` is accepted, it becomes a future anchor. If it is rejected, it
+still receives a global pose, but it is not added to the map and it is not used
+as a future alignment anchor.
+
+Every new window has its own VGGT-Omega local coordinates. The overlap cameras
+are used to estimate a similarity transform:
+
+```text
+p_global ~= s * R * p_window + t
+global_from_window = [sR, t]
+```
+
+The implementation uses Umeyama alignment on overlapping camera centers. The
+same Sim(3) is then applied to:
+
+- predicted point maps;
+- camera-from-world extrinsics;
+- regenerated `pose_enc` values.
+
+This keeps `extrinsic`, `pose_enc`, and `world_points_from_depth` in the same
+ground-normalized global frame.
+
+## Runtime Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Runner as run_incremental_slam.py
+    participant VGGT as VGGT-Omega
+    participant Tracker as Ground tracker
+    participant Output as Output files
+
+    User->>Runner: image glob, checkpoint, window size, threshold
+    Runner->>VGGT: first image window
+    VGGT-->>Runner: pose, depth, confidence, points
+    Runner->>Tracker: estimate ground transform
+    Tracker-->>Runner: normalized global frame
+    loop each later frame
+        Runner->>VGGT: accepted overlap frames + candidate
+        VGGT-->>Runner: local window geometry
+        Runner->>Tracker: Sim(3) align and motion-gate candidate
+    end
+    Runner->>Output: ground_tracking_slam_points.ply
+    Runner->>Output: ground_tracking_slam_predictions.npz
+```
+
+## Running
+
+Example:
 
 ```bash
-python demo_gradio.py \
+python scripts/run_incremental_slam.py \
+  'outputs/dji_0005_10s_2fps/frames/*.jpeg' \
   --checkpoint checkpoints/VGGT-Omega-1B-512/model.pt \
-  --image-resolution 512
+  --output-dir outputs/dji_0005_10s_2fps/ground_tracking_w5_thresh0p1 \
+  --window-size 5 \
+  --displacement-threshold 0.1 \
+  --image-resolution 512 \
+  --max-points 300000 \
+  --conf-percentile 20
 ```
 
-The demo accepts uploaded images or a video, runs camera and depth inference,
-and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
-scene.
+Common options:
 
-## Runtime and GPU Memory
+| Option | Meaning |
+| :--- | :--- |
+| `--checkpoint` | Path to the released VGGT-Omega checkpoint. |
+| `--window-size` | Number of frames per VGGT-Omega tracking window. The candidate frame is appended after the latest accepted anchors. |
+| `--displacement-threshold` | Minimum normalized translation required before a candidate is accepted into the map and future anchor set. |
+| `--image-resolution` | Preprocessing resolution passed to VGGT-Omega. Use `512` for the `VGGT-Omega-1B-512` checkpoint. |
+| `--conf-percentile` | Confidence percentile used when exporting the point cloud. |
+| `--max-points` | Maximum number of exported PLY points after filtering. |
+| `--device` | `cuda` or `cpu`. CUDA is expected for practical runs. |
 
-We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a
-single NVIDIA A100 GPU with 624x416 input images. The measurement covers the full
-inference program, from loading the model weights onto the GPU through the
-forward pass, so it includes both the memory needed to store the model itself
-and the memory used by inference activations and buffers. In other words, a GPU
-with at least the listed available memory is able to run the corresponding
-number of input frames under this setup.
+Outputs:
 
-| **Input Frames** | 1 | 10 | 25 | 50 | 100 | 200 | 300 | 400 | 500 |
-|:----------------:|:-:|:--:|:--:|:--:|:---:|:---:|:---:|:---:|:---:|
-| **Peak Memory (GB)** | 6.02 | 6.67 | 7.80 | 9.66 | 13.37 | 20.82 | 28.26 | 35.71 | 43.15 |
+- `ground_tracking_slam_points.ply`: filtered colored point cloud containing
+  accepted map frames.
+- `ground_tracking_slam_predictions.npz`: poses and diagnostics for all input
+  frames.
 
-The benchmark uses [`load_and_preprocess_images`](./vggt_omega/utils/load_fn.py)
-with the default `mode="balanced"` and `image_resolution=512`. For these roughly
-3:2 landscape images, this produces 624x416 inputs. You can set
-`mode="max_size"` to resize the longest side to 512 instead; for the same aspect
-ratio, this gives about 512x336 inputs and uses less GPU memory.
+The `.npz` file contains:
 
-## License
+| Key | Description |
+| :--- | :--- |
+| `pose_enc` | Global pose encoding for every input frame. |
+| `extrinsic` | Ground-normalized camera-from-world extrinsics for every frame. |
+| `intrinsic` | Predicted intrinsics for every frame. |
+| `image_paths` | Input image paths after glob expansion. |
+| `accepted_mask` | Boolean mask showing which frames entered the map and future anchor set. |
+| `accepted_indices` | Integer indices of accepted frames. |
+| `displacements` | Candidate displacement from the latest accepted frame. |
+| `ground_transform` | Initial Sim(3)-style ground normalization transform. |
+| `ground_plane` | Estimated first-frame ground plane. |
+| `ground_inliers` | Number of RANSAC inliers for the ground plane. |
+| `ground_ransac_threshold` | RANSAC plane threshold derived from coarse distance. |
+| `ground_coarse_distance` | Coarse camera-to-plane distance before RANSAC refinement. |
+| `global_from_window` | Per-window transforms into the global frame. |
 
-See the [LICENSE](./LICENSE) file for details about the license under which
-this code is made available.
+## Docker Checkpoints
 
-[^release]: This Release is intended to support the open source research community.
+The Dockerfile downloads both released checkpoints during build using a BuildKit
+secret named `hf_token`:
 
-```bibtex
-@misc{wang2026vggtomega,
-      title={VGGT-$\Omega$}, 
-      author={Jianyuan Wang and Minghao Chen and Shangzhan Zhang and Nikita Karaev and Johannes Schönberger and Patrick Labatut and Piotr Bojanowski and David Novotny and Andrea Vedaldi and Christian Rupprecht},
-      year={2026},
-      eprint={2605.15195},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2605.15195}, 
-}
+- `/app/checkpoints/VGGT-Omega-1B-512/model.pt`
+- `/app/checkpoints/VGGT-Omega-1B-256-Text-Alignment/model.pt`
+
+Build example:
+
+```bash
+printf '%s' "$HF_TOKEN" > /tmp/vggt_omega_hf_token
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=hf_token,src=/tmp/vggt_omega_hf_token \
+  -t vggt-omega:local .
+rm -f /tmp/vggt_omega_hf_token
 ```
+
+Run example:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /home/ubuntu/resplat/users/familyroom0526:/data/familyroom0526:ro \
+  -v /home/ubuntu/vggt-omega/outputs:/outputs \
+  vggt-omega:local \
+  python scripts/run_incremental_slam.py \
+    '/data/familyroom0526/*.jpeg' \
+    --checkpoint /app/checkpoints/VGGT-Omega-1B-512/model.pt \
+    --output-dir /outputs/familyroom_ground_tracking \
+    --window-size 5 \
+    --displacement-threshold 0.1 \
+    --image-resolution 512
+```
+
+Do not hard-code a Hugging Face token into the Dockerfile. Use the secret mount
+so the token is available only during the build step.
+
+## Current Limitations
+
+- Ground estimation is heuristic. It assumes the first view contains enough
+  visible ground below the camera.
+- The global up direction and normalized scale come from the first fitted plane.
+  A bad first plane will affect the whole track.
+- Sim(3) is estimated only from overlapping camera centers. Nearly pure rotation
+  or tiny baselines can still be unstable.
+- Rejected frames still have pose output, but their points are not added to the
+  exported map.
+- There is no loop closure, bundle adjustment, dense fusion, or global pose
+  graph optimization.
+- The tracker uses the released full-attention VGGT-Omega checkpoint directly.
+  It is not a trained recurrent, causal, or metric SLAM system.
+
+## Verification
+
+Run the focused SLAM API tests:
+
+```bash
+python -m pytest -q tests/test_incremental_slam_api.py
+```
+
+The tests include point-map convention checks and Sim(3) recovery checks for
+scale, rotation, and translation.
