@@ -6,8 +6,8 @@
 
 """VGGT-Omega inference package."""
 
-from .models import VGGTOmega
+from .models import CausalVGGTOmega, VGGTOmega
 
 __version__ = "0.0.1"
 
-__all__ = ["VGGTOmega", "__version__"]
+__all__ = ["CausalVGGTOmega", "VGGTOmega", "__version__"]
