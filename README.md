@@ -39,6 +39,56 @@ ground-normalized global frame. Fine-tuning is therefore not required to use the
 current pipeline, although domain-specific data can still help if the input
 videos differ substantially from the checkpoint's training distribution.
 
+
+## Improvement over VGGT-omega
+
+This repository also includes an experimental incremental SLAM model path that moves beyond an output-side pose wrapper. The goal is to let the model understand fixed historical poses internally, so registered frames act as SLAM anchors while new frames are estimated against cached history.
+
+The intended model interface is:
+
+```text
+history_images, history_fixed_poses, current_images
+    -> pose-conditioned fixed memory / KV cache
+    -> current-frame predictions
+```
+
+Key ideas:
+
+- **Fixed pose conditioning**: known history poses are encoded and injected into camera/register tokens before the causal transformer path, so attention can treat those frames as geometric anchors.
+- **Frozen history semantics**: fixed poses are immutable inputs. When a pose is marked fixed, the model preserves it in `predictions["pose_enc"]` instead of replacing it with a newly predicted value.
+- **Current-frame prediction**: unknown current frames still flow through the original camera/depth heads, while fixed history frames can be masked out or passed through.
+- **KV-cache reuse**: fixed history tokens are encoded once and appended to the causal inter-frame KV cache, allowing later frames to query registered memory without recomputing the entire prefix.
+- **No-op initialization**: the new fixed-pose adapter starts at zero, so original VGGT-Omega weights remain useful and the incremental model initially behaves close to the original checkpoint.
+- **Checkpoint compatibility**: the original encoder, transformer, and head weights are reused. Newly introduced pose-conditioning parameters can be loaded with `strict=False` and fine-tuned later.
+
+This stage is designed to pass smoke tests before retraining: fixed-pose inputs flow into the model, locked poses are preserved in the output, and the KV cache still grows across incremental chunks. Fine-tuning is recommended for final quality because the released VGGT-Omega checkpoint was not trained to interpret fixed poses as SLAM anchors.
+
+Minimal API example:
+
+```python
+import torch
+from vggt_omega.models import CausalVGGTOmega
+
+model = CausalVGGTOmega().eval()
+state = model.init_slam_state()
+images = torch.rand(1, 2, 3, 512, 512)
+fixed_pose_enc = torch.zeros(1, 2, 9)
+fixed_pose_mask = torch.tensor([[True, False]])
+
+with torch.inference_mode():
+    predictions, state = model.forward_incremental(
+        images,
+        state,
+        fixed_pose_enc=fixed_pose_enc,
+        fixed_pose_mask=fixed_pose_mask,
+    )
+
+assert torch.equal(predictions["fixed_pose_mask"], fixed_pose_mask)
+assert torch.allclose(predictions["pose_enc"][:, 0], fixed_pose_enc[:, 0])
+```
+
+`fixed_pose_mask=True` means the corresponding input pose is a locked SLAM anchor. The raw camera-head output is still available as `predictions["pose_enc_model"]` for debugging or training losses.
+
 ## What Changed From VGGT-Omega
 
 VGGT-Omega is normally a batch model: it receives a set or short sequence of
@@ -248,42 +298,38 @@ The `.npz` file contains:
 | `ground_coarse_distance` | Coarse camera-to-plane distance before RANSAC refinement. |
 | `global_from_window` | Per-window transforms into the global frame. |
 
-## Docker Checkpoints
+## Docker Compose
 
-The Dockerfile downloads both released checkpoints during build using a BuildKit
-secret named `hf_token`:
+The Dockerfile now builds the dependency/runtime image only. Repository code is not baked into the image; `docker-compose.yml` bind-mounts the host checkout into `/app` so code changes are picked up dynamically. The compose service also mounts the host `/tmp` into the container `/tmp`.
+
+By default, compose uses checkpoints from the mounted host checkout:
 
 - `/app/checkpoints/VGGT-Omega-1B-512/model.pt`
 - `/app/checkpoints/VGGT-Omega-1B-256-Text-Alignment/model.pt`
 
-Build example:
+The Dockerfile can optionally bake checkpoints into `/opt/vggt-omega/checkpoints` if an `hf_token` BuildKit secret is provided, but `docker compose build vggt-omega` no longer requires that token file.
+
+Build and run the demo with compose:
 
 ```bash
-printf '%s' "$HF_TOKEN" > /tmp/vggt_omega_hf_token
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,src=/tmp/vggt_omega_hf_token \
-  -t vggt-omega:local .
-rm -f /tmp/vggt_omega_hf_token
+docker compose build vggt-omega
+docker compose up vggt-omega
 ```
 
-Run example:
+Run the SLAM script through the same service:
 
 ```bash
-docker run --rm --gpus all --ipc=host \
-  -v /home/ubuntu/resplat/users/familyroom0526:/data/familyroom0526:ro \
-  -v /home/ubuntu/vggt-omega/outputs:/outputs \
-  vggt-omega:local \
+docker compose run --rm vggt-omega \
   python scripts/run_incremental_slam.py \
-    '/data/familyroom0526/*.jpeg' \
+    '/tmp/frames/*.jpeg' \
     --checkpoint /app/checkpoints/VGGT-Omega-1B-512/model.pt \
-    --output-dir /outputs/familyroom_ground_tracking \
+    --output-dir /tmp/vggt_omega_slam \
     --window-size 5 \
     --displacement-threshold 0.1 \
     --image-resolution 512
 ```
 
-Do not hard-code a Hugging Face token into the Dockerfile. Use the secret mount
-so the token is available only during the build step.
+Set `VGGT_OMEGA_PORT` to change the exposed Gradio port. Do not hard-code a Hugging Face token into the Dockerfile; use a BuildKit secret only when intentionally baking checkpoints into the image.
 
 ## Current Limitations
 

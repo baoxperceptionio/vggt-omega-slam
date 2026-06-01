@@ -90,6 +90,61 @@ def _warn_if_rope_not_max(aggregator: nn.Module) -> None:
             )
 
 
+def _normalize_fixed_pose_inputs(
+    fixed_pose_enc: torch.Tensor | None,
+    fixed_pose_mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    num_frames: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if fixed_pose_enc is None:
+        if fixed_pose_mask is not None:
+            raise ValueError("fixed_pose_mask requires fixed_pose_enc.")
+        return None, None
+
+    if fixed_pose_enc.dim() == 2:
+        fixed_pose_enc = fixed_pose_enc.unsqueeze(0)
+    if fixed_pose_enc.shape[:2] != (batch_size, num_frames):
+        raise ValueError(
+            "fixed_pose_enc must have shape "
+            f"({batch_size}, {num_frames}, pose_dim), got {tuple(fixed_pose_enc.shape)}."
+        )
+
+    if fixed_pose_mask is None:
+        fixed_pose_mask = torch.ones(
+            batch_size,
+            num_frames,
+            dtype=torch.bool,
+            device=fixed_pose_enc.device,
+        )
+    elif fixed_pose_mask.dim() == 1:
+        fixed_pose_mask = fixed_pose_mask.unsqueeze(0)
+    if fixed_pose_mask.shape != (batch_size, num_frames):
+        raise ValueError(
+            "fixed_pose_mask must have shape "
+            f"({batch_size}, {num_frames}), got {tuple(fixed_pose_mask.shape)}."
+        )
+
+    return fixed_pose_enc.to(device=device), fixed_pose_mask.to(device=device, dtype=torch.bool)
+
+
+def _apply_fixed_pose_passthrough(
+    pose_enc: torch.Tensor,
+    fixed_pose_enc: torch.Tensor,
+    fixed_pose_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if fixed_pose_mask is None:
+        fixed_pose_mask = torch.ones(
+            pose_enc.shape[:2],
+            dtype=torch.bool,
+            device=pose_enc.device,
+        )
+    fixed_pose_enc = fixed_pose_enc.to(device=pose_enc.device, dtype=pose_enc.dtype)
+    fixed_pose_mask = fixed_pose_mask.to(device=pose_enc.device, dtype=torch.bool)
+    return torch.where(fixed_pose_mask.unsqueeze(-1), fixed_pose_enc, pose_enc)
+
+
 class CausalVGGTOmega(nn.Module):
     """Cache-backed VGGT-Omega student for offline incremental SLAM inference."""
 
@@ -125,14 +180,34 @@ class CausalVGGTOmega(nn.Module):
     def init_slam_state(self) -> dict:
         return init_slam_state()
 
-    def forward_incremental(self, images: torch.Tensor, state: dict | None = None) -> tuple[dict[str, torch.Tensor], dict]:
+    def forward_incremental(
+        self,
+        images: torch.Tensor,
+        state: dict | None = None,
+        *,
+        fixed_pose_enc: torch.Tensor | None = None,
+        fixed_pose_mask: torch.Tensor | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
+
+        fixed_pose_enc, fixed_pose_mask = _normalize_fixed_pose_inputs(
+            fixed_pose_enc,
+            fixed_pose_mask,
+            batch_size=images.shape[0],
+            num_frames=images.shape[1],
+            device=images.device,
+        )
 
         use_cuda_amp = images.is_cuda
         amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_cuda_amp):
-            aggregated_tokens_list, patch_token_start, state = self.aggregator.forward_incremental(images, state)
+            aggregated_tokens_list, patch_token_start, state = self.aggregator.forward_incremental(
+                images,
+                state,
+                fixed_pose_enc=fixed_pose_enc,
+                fixed_pose_mask=fixed_pose_mask,
+            )
 
         final_tokens = aggregated_tokens_list[-1]
         if final_tokens is None:
@@ -143,10 +218,15 @@ class CausalVGGTOmega(nn.Module):
         }
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None:
-                predictions["pose_enc"] = self.camera_head(
+                pose_enc = self.camera_head(
                     aggregated_tokens_list,
                     patch_token_start=patch_token_start,
                 )
+                if fixed_pose_enc is not None:
+                    predictions["pose_enc_model"] = pose_enc
+                    pose_enc = _apply_fixed_pose_passthrough(pose_enc, fixed_pose_enc, fixed_pose_mask)
+                    predictions["fixed_pose_mask"] = fixed_pose_mask
+                predictions["pose_enc"] = pose_enc
 
             if self.dense_head is not None:
                 depth, depth_conf = self.dense_head(
@@ -177,10 +257,17 @@ class CausalVGGTOmega(nn.Module):
         state: dict | None = None,
         *,
         keyframe_stride: int = 8,
+        fixed_pose_enc: torch.Tensor | None = None,
+        fixed_pose_mask: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         state = self.init_slam_state() if state is None else state
         start_frame = int(state.get("num_frames_seen", 0))
-        predictions, state = self.forward_incremental(images_chunk, state)
+        predictions, state = self.forward_incremental(
+            images_chunk,
+            state,
+            fixed_pose_enc=fixed_pose_enc,
+            fixed_pose_mask=fixed_pose_mask,
+        )
 
         if keyframe_stride > 0 and "pose_enc" in predictions and "world_points_from_depth" in predictions:
             num_new = predictions["pose_enc"].shape[1]

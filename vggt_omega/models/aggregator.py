@@ -317,10 +317,17 @@ class CausalSelfAttentionBlockAdapter(nn.Module):
 class CausalAggregator(Aggregator):
     """Frame-causal, cache-backed aggregator for offline incremental SLAM."""
 
+    def __init__(self, *args, pose_dim: int = 9, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fixed_pose_conditioner = FixedPoseConditioner(pose_dim=pose_dim, embed_dim=self.camera_token.shape[-1])
+
     def forward_incremental(
         self,
         images: torch.Tensor,
         state: dict | None = None,
+        *,
+        fixed_pose_enc: torch.Tensor | None = None,
+        fixed_pose_mask: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor | None], int, dict]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
@@ -364,6 +371,15 @@ class CausalAggregator(Aggregator):
 
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
         _, num_tokens, embed_dim = tokens.shape
+        tokens = self.fixed_pose_conditioner(
+            tokens,
+            fixed_pose_enc=fixed_pose_enc,
+            fixed_pose_mask=fixed_pose_mask,
+            batch_size=batch_size,
+            num_frames=num_frames,
+            num_tokens=num_tokens,
+            patch_token_start=self.patch_token_start,
+        )
 
         patch_grid_size = (height // self.patch_size, width // self.patch_size)
         with torch.no_grad():
@@ -475,6 +491,60 @@ class CausalAggregator(Aggregator):
             "tokens_per_frame": tokens_per_frame,
         }
         return out
+
+
+class FixedPoseConditioner(nn.Module):
+    """No-op-initialized adapter that marks known SLAM poses inside history tokens."""
+
+    def __init__(self, pose_dim: int, embed_dim: int) -> None:
+        super().__init__()
+        self.pose_norm = nn.LayerNorm(pose_dim)
+        self.pose_proj = nn.Linear(pose_dim, embed_dim)
+        nn.init.zeros_(self.pose_proj.weight)
+        nn.init.zeros_(self.pose_proj.bias)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        fixed_pose_enc: torch.Tensor | None,
+        fixed_pose_mask: torch.Tensor | None,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        patch_token_start: int,
+    ) -> torch.Tensor:
+        if fixed_pose_enc is None:
+            if fixed_pose_mask is not None:
+                raise ValueError("fixed_pose_mask requires fixed_pose_enc.")
+            return tokens
+
+        if fixed_pose_enc.shape[:2] != (batch_size, num_frames):
+            raise ValueError(
+                "fixed_pose_enc must have shape "
+                f"({batch_size}, {num_frames}, pose_dim), got {tuple(fixed_pose_enc.shape)}."
+            )
+        if fixed_pose_mask is None:
+            fixed_pose_mask = torch.ones(
+                batch_size,
+                num_frames,
+                dtype=torch.bool,
+                device=fixed_pose_enc.device,
+            )
+        if fixed_pose_mask.shape != (batch_size, num_frames):
+            raise ValueError(
+                "fixed_pose_mask must have shape "
+                f"({batch_size}, {num_frames}), got {tuple(fixed_pose_mask.shape)}."
+            )
+
+        fixed_pose_enc = fixed_pose_enc.to(device=tokens.device, dtype=torch.float32)
+        fixed_pose_mask = fixed_pose_mask.to(device=tokens.device, dtype=torch.bool)
+        pose_delta = self.pose_proj(self.pose_norm(fixed_pose_enc)).to(dtype=tokens.dtype)
+        pose_delta = pose_delta * fixed_pose_mask.unsqueeze(-1).to(dtype=pose_delta.dtype)
+
+        tokens = tokens.view(batch_size, num_frames, num_tokens, -1).clone()
+        tokens[:, :, :patch_token_start] = tokens[:, :, :patch_token_start] + pose_delta.unsqueeze(2)
+        return tokens.view(batch_size * num_frames, num_tokens, -1)
 
 
 def init_slam_state() -> dict:

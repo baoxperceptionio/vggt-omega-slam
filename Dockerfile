@@ -3,8 +3,8 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3
 FROM ${BASE_IMAGE}
 
-ARG VGGT_OMEGA_CHECKPOINT_DIR=/app/checkpoints/VGGT-Omega-1B-512
-ARG VGGT_OMEGA_TEXT_CHECKPOINT_DIR=/app/checkpoints/VGGT-Omega-1B-256-Text-Alignment
+ARG VGGT_OMEGA_CHECKPOINT_DIR=/opt/vggt-omega/checkpoints/VGGT-Omega-1B-512
+ARG VGGT_OMEGA_TEXT_CHECKPOINT_DIR=/opt/vggt-omega/checkpoints/VGGT-Omega-1B-256-Text-Alignment
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -14,18 +14,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VGGT_OMEGA_IMAGE_RESOLUTION=512
 
 WORKDIR /app
+ENV PYTHONPATH=/app
 
-COPY requirements.txt requirements_demo.txt pyproject.toml README.md LICENSE ./
-COPY vggt_omega ./vggt_omega
-COPY demo_gradio.py visual_util.py ./
-COPY scripts ./scripts
-COPY examples ./examples
+COPY requirements.txt requirements_demo.txt /tmp/vggt-omega-build/
 
 RUN python -m pip install --upgrade pip && \
-    python -m pip install -r requirements.txt -r requirements_demo.txt && \
-    python -m pip install -e .
+    python -m pip install -r /tmp/vggt-omega-build/requirements.txt -r /tmp/vggt-omega-build/requirements_demo.txt
 
-RUN --mount=type=secret,id=hf_token,required=true <<"EOF"
+RUN --mount=type=secret,id=hf_token,required=false <<"EOF"
 set -eu
 python - <<"PY"
 from pathlib import Path
@@ -33,7 +29,12 @@ import os
 import shutil
 import urllib.request
 
-token = Path("/run/secrets/hf_token").read_text(encoding="utf-8").strip()
+token_path = Path("/run/secrets/hf_token")
+if not token_path.exists() or not token_path.read_text(encoding="utf-8").strip():
+    print("No hf_token build secret provided; skipping checkpoint download.")
+    raise SystemExit(0)
+
+token = token_path.read_text(encoding="utf-8").strip()
 downloads = {
     "vggt_omega_1b_512.pt": Path(os.environ["VGGT_OMEGA_CHECKPOINT"]),
     "vggt_omega_1b_256_text.pt": Path(os.environ["VGGT_OMEGA_TEXT_CHECKPOINT"]),
