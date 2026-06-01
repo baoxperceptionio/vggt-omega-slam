@@ -13,6 +13,32 @@ SLAM. The older append-only KV-cache mode and the plain sliding-window mode were
 removed from the command-line interface to avoid maintaining several coordinate
 systems at once.
 
+## Improvements Over VGGT-Omega
+
+VGGT-Omega is designed for strong geometry prediction inside one local image
+set. This repository improves the practical long-video workflow around that
+checkpoint without requiring a retrained model:
+
+- **Longer sequence handling**: videos are processed through overlapping
+  windows instead of one monolithic inference call.
+- **Consistent global frame**: the first window defines a ground-normalized
+  coordinate system, then later windows are aligned back into it with Sim(3).
+- **Motion-aware mapping**: frames are accepted into the map only after enough
+  translated motion, which reduces redundant point-cloud export from nearly
+  identical views.
+- **Checkpoint compatibility**: the released VGGT-Omega checkpoint can be used
+  directly because the change is an inference wrapper, not a new learned
+  recurrent architecture.
+- **Operational outputs**: the runner exports both a filtered colored PLY point
+  cloud and an NPZ package with poses, intrinsics, accepted-frame diagnostics,
+  ground-plane metadata, and per-window transforms.
+
+This is not a KV-cache streaming model. Each tracking step still runs
+VGGT-Omega on a bounded overlap window, then aligns that window into the
+ground-normalized global frame. Fine-tuning is therefore not required to use the
+current pipeline, although domain-specific data can still help if the input
+videos differ substantially from the checkpoint's training distribution.
+
 ## What Changed From VGGT-Omega
 
 VGGT-Omega is normally a batch model: it receives a set or short sequence of
