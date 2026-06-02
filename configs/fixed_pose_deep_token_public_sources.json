@@ -12,19 +12,21 @@
   "teacher_cache": {
     "teacher_window_length": 100,
     "teacher_window_stride": 96,
-    "subclip_lengths": [5],
+    "subclip_lengths": [2, 3, 4, 5],
     "subclip_stride": 1,
     "canonicalize_subclips": false,
     "cache_teacher_tokens": true,
     "dji_cache_container": "/app/outputs/teacher_cache/cache_global_w100_sub5_tokens",
-    "public_rgb_cache_container": "/app/outputs/teacher_cache/cache_public_rgb_w100_sub5_tokens",
-    "candidate_eth_cam0_cache_container": "/app/outputs/teacher_cache/cache_eth_cam0_w100_sub5_tokens",
-    "candidate_mit_jpg_cache_container": "/app/outputs/teacher_cache/cache_mit_jpg_w100_sub5_tokens"
+    "public_rgb_cache_container": "/app/outputs/teacher_cache/cache_public_rgb_w100_sub2_3_4_5_tokens",
+    "candidate_eth_cam0_cache_container": "/app/outputs/teacher_cache/cache_eth_cam0_w100_sub2_3_4_5_tokens",
+    "candidate_mit_jpg_cache_container": "/app/outputs/teacher_cache/cache_mit_jpg_w100_sub2_3_4_5_tokens"
   },
   "training": {
     "epochs": 1,
     "batch_size": 3,
-    "lr": 0.000003,
+    "lr": 0.000008,
+    "curriculum_clip_lengths": [2, 3, 4, 5],
+    "curriculum_strategy": "Sequential fixed-history stages: 1+1, then 2+1, then 3+1, then 4+1. Each stage fixes all history frames and supervises only the last frame.",
     "token_weight": 0.1,
     "fixed_token_weight": 1.0,
     "target_token_weight": 1.0,
@@ -35,7 +37,7 @@
     "wandb": {
       "enabled_by_default_in_public_only_script": true,
       "project": "vggt-fixed-pose",
-      "run_name": "fixed-pose-public-only-tum-eth-mit-epoch1",
+      "run_name": "fixed-pose-public-only-curriculum-lr8e-6-epoch1",
       "mode": "online",
       "log_every": 25,
       "log_samples": 1,

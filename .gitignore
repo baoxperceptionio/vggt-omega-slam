@@ -10,6 +10,8 @@ build/
 dist/
 outputs/
 demo_outputs/
+public_data/
+wandb/
 checkpoints/
 skyseg.onnx
 skyseg.onnx.tmp

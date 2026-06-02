@@ -117,10 +117,10 @@ def run_fixed_pose_kv_slam(
                 accepted_mask[frame_idx] = True
                 last_map_center = current_center
 
-            # Commit the pose in the same ground/global coordinate frame that
-            # is exported. Using the raw probe pose here would train/infer with
-            # fixed anchors in a different gauge than the SLAM trajectory.
-            fixed_pose = torch.from_numpy(rebased["pose_enc"][None]).to(
+            # Commit in the model's native gauge. The exported trajectory is
+            # ground-normalized separately; mixing that world gauge into the KV
+            # cache makes fixed-pose conditioning inconsistent with training.
+            fixed_pose = torch.from_numpy(local["pose_enc"][None]).to(
                 device=predictions["pose_enc"].device,
                 dtype=predictions["pose_enc"].dtype,
             )
@@ -215,6 +215,7 @@ def run_fixed_pose_window_slam(
         raise ValueError(f"Need at least {window_size} frames for fixed-pose window inference.")
 
     all_pose_enc: list[np.ndarray | None] = [None] * num_frames
+    all_pose_enc_model: list[np.ndarray | None] = [None] * num_frames
     all_extrinsic: list[np.ndarray | None] = [None] * num_frames
     all_intrinsic: list[np.ndarray | None] = [None] * num_frames
     accepted_mask = np.zeros(num_frames, dtype=bool)
@@ -229,14 +230,20 @@ def run_fixed_pose_window_slam(
     accepted_indices: list[int] = []
     last_map_center: np.ndarray | None = None
 
-    def store_frame(frame_idx: int, pred_np: dict[str, np.ndarray], local_idx: int) -> None:
+    def store_frame(
+        frame_idx: int,
+        rebased_np: dict[str, np.ndarray],
+        model_np: dict[str, np.ndarray],
+        local_idx: int,
+    ) -> None:
         nonlocal last_map_center
-        all_pose_enc[frame_idx] = pred_np["pose_enc"][local_idx]
-        all_extrinsic[frame_idx] = pred_np["extrinsic"][local_idx]
-        all_intrinsic[frame_idx] = pred_np["intrinsic"][local_idx]
+        all_pose_enc[frame_idx] = rebased_np["pose_enc"][local_idx]
+        all_pose_enc_model[frame_idx] = model_np["pose_enc"][local_idx]
+        all_extrinsic[frame_idx] = rebased_np["extrinsic"][local_idx]
+        all_intrinsic[frame_idx] = model_np["intrinsic"][local_idx]
         locked_pose_mask[frame_idx] = True
 
-        current_center = _camera_center(pred_np["extrinsic"][local_idx])
+        current_center = _camera_center(rebased_np["extrinsic"][local_idx])
         if last_map_center is None:
             displacement = 0.0
             accept_for_map = True
@@ -246,7 +253,7 @@ def run_fixed_pose_window_slam(
         displacements[frame_idx] = displacement
 
         if accept_for_map:
-            _append_map_frame(map_predictions, pred_np, pred_np, local_idx)
+            _append_map_frame(map_predictions, rebased_np, model_np, local_idx)
             accepted_indices.append(frame_idx)
             accepted_mask[frame_idx] = True
             last_map_center = current_center
@@ -270,16 +277,16 @@ def run_fixed_pose_window_slam(
         # Bootstrap the four fixed history frames. Frame 4 and later are then
         # predicted with exactly the FT setup: 4 locked poses + 1 unlocked target.
         for frame_idx in range(window_size - 1):
-            store_frame(frame_idx, {**initial_local, **initial_rebased}, frame_idx)
+            store_frame(frame_idx, initial_rebased, initial_local, frame_idx)
 
         for frame_idx in range(window_size - 1, num_frames):
             window_indices = list(range(frame_idx - (window_size - 1), frame_idx + 1))
             fixed_pose = np.zeros((1, window_size, 9), dtype=np.float32)
             fixed_mask_np = np.zeros((1, window_size), dtype=bool)
             for local_idx, history_idx in enumerate(window_indices[:-1]):
-                if all_pose_enc[history_idx] is None:
+                if all_pose_enc_model[history_idx] is None:
                     raise RuntimeError(f"Missing fixed pose for history frame {history_idx}.")
-                fixed_pose[0, local_idx] = all_pose_enc[history_idx]
+                fixed_pose[0, local_idx] = all_pose_enc_model[history_idx]
                 fixed_mask_np[0, local_idx] = True
 
             fixed_pose_tensor = torch.from_numpy(fixed_pose).to(device=device, dtype=images.dtype)
@@ -291,7 +298,8 @@ def run_fixed_pose_window_slam(
                 fixed_pose_mask=fixed_mask,
             )
             pred_np = _causal_predictions_to_numpy(predictions)
-            store_frame(frame_idx, pred_np, window_size - 1)
+            rebased_np = _apply_global_transform(pred_np, ground_transform)
+            store_frame(frame_idx, rebased_np, pred_np, window_size - 1)
 
     all_pose = np.stack(all_pose_enc, axis=0)
     all_ext = np.stack(all_extrinsic, axis=0)
@@ -307,6 +315,7 @@ def run_fixed_pose_window_slam(
     np.savez_compressed(
         output_path / "fixed_pose_kv_slam_predictions.npz",
         pose_enc=all_pose,
+        pose_enc_model=np.stack(all_pose_enc_model, axis=0),
         extrinsic=all_ext,
         intrinsic=all_int,
         image_paths=np.array(image_paths),

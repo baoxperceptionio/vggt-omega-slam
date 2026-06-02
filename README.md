@@ -225,6 +225,7 @@ The `.npz` file contains:
 | Key | Description |
 | :--- | :--- |
 | `pose_enc` | Ground-normalized pose encoding for every input frame. |
+| `pose_enc_model` | Model-gauge pose encoding for every input frame, used for fixed-pose history conditioning before ground normalization. |
 | `extrinsic` | Ground-normalized camera-from-world extrinsics for every frame. |
 | `intrinsic` | Predicted intrinsics for every frame. |
 | `image_paths` | Input image paths after glob expansion. |
@@ -347,8 +348,10 @@ docker compose run --rm vggt-omega \
     --freeze-backbone
 ```
 
-The fixed-pose SLAM runner also commits locked poses in the exported
-ground/global coordinate frame, so inference now matches this cache convention.
+The fixed-pose SLAM runner commits locked poses in the model's native gauge, then
+exports a separately ground-normalized trajectory in `pose_enc` and `extrinsic`.
+This keeps fixed-pose conditioning aligned with training while preserving
+ground-normalized outputs for maps and diagnostics.
 
 ## Docker Compose
 

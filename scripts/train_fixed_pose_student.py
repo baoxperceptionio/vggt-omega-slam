@@ -47,6 +47,16 @@ class CachedClip:
 
 
 @dataclass(frozen=True)
+class TrainingStage:
+    name: str
+    clip_length: int
+    fixed_frames: int | None
+    items: list[Any]
+    epochs: int
+    max_steps: int | None
+
+
+@dataclass(frozen=True)
 class PoseLoss:
     total: torch.Tensor
     translation: torch.Tensor
@@ -398,6 +408,8 @@ def train_fixed_pose_student(
     epochs: int = 1,
     clip_length: int = 5,
     fixed_frames: int | None = None,
+    curriculum_clip_lengths: list[int] | None = None,
+    curriculum_steps_per_stage: list[int] | None = None,
     cache_stride: int = 10,
     lr: float = 1e-5,
     pose_weight: float = 1.0,
@@ -422,8 +434,14 @@ def train_fixed_pose_student(
     wandb_log_every: int | None = None,
     wandb_log_samples: int = 1,
 ) -> None:
-    if fixed_frames is not None and (fixed_frames < 1 or fixed_frames >= clip_length):
+    curriculum_clip_lengths = curriculum_clip_lengths or []
+    curriculum_steps_per_stage = curriculum_steps_per_stage or []
+    if fixed_frames is not None and (fixed_frames < 1 or fixed_frames >= clip_length) and not curriculum_clip_lengths:
         raise ValueError("fixed_frames must be in [1, clip_length - 1].")
+    if any(length < 2 for length in curriculum_clip_lengths):
+        raise ValueError("Every curriculum clip length must be at least 2.")
+    if curriculum_steps_per_stage and len(curriculum_steps_per_stage) != len(curriculum_clip_lengths):
+        raise ValueError("--curriculum-steps-per-stage must have one value per curriculum clip length.")
     if epochs < 1:
         raise ValueError("epochs must be at least 1.")
     if steps is not None and steps < 1:
@@ -482,16 +500,28 @@ def train_fixed_pose_student(
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=lr, weight_decay=0.01)
     profiles: list[dict[str, Any]] = []
     loss_history: list[float] = []
-    source_count = len(cached_clips) if use_cache else len(online_samples)
-    batches_per_epoch = (source_count + batch_size - 1) // batch_size
-    max_steps = steps if steps is not None else epochs * batches_per_epoch
+    training_stages = _build_training_stages(
+        cached_clips if use_cache else online_samples,
+        use_cache=use_cache,
+        frame_sequences=frame_sequences,
+        clip_length=clip_length,
+        fixed_frames=fixed_frames,
+        curriculum_clip_lengths=curriculum_clip_lengths,
+        curriculum_steps_per_stage=curriculum_steps_per_stage,
+        epochs=epochs,
+        batch_size=batch_size,
+    )
+    source_count = sum(len(stage.items) for stage in training_stages)
+    planned_steps = sum(_planned_stage_steps(stage, batch_size) for stage in training_stages)
+    max_steps = steps if steps is not None else planned_steps
     wandb_log_every = wandb_log_every if wandb_log_every is not None else log_every
     wandb_module = None
     wandb_run = None
 
     print(
         f"Training fixed-pose student: source={'cache' if use_cache else 'online'} clips={source_count} "
-        f"epochs={epochs} max_steps={max_steps} clip_length={clip_length if not use_cache else 'mixed'} "
+        f"stages={[(stage.name, stage.clip_length, len(stage.items)) for stage in training_stages]} "
+        f"epochs_per_stage={epochs} max_steps={max_steps} clip_length={clip_length if not use_cache else 'mixed'} "
         f"fixed_frames={fixed_frames if fixed_frames is not None else 'auto-last'} "
         f"batch_size={batch_size} resolution={image_resolution}"
     )
@@ -508,6 +538,19 @@ def train_fixed_pose_student(
             "epochs": epochs,
             "clip_length": clip_length,
             "fixed_frames": fixed_frames,
+            "curriculum_clip_lengths": curriculum_clip_lengths,
+            "curriculum_steps_per_stage": curriculum_steps_per_stage,
+            "training_stages": [
+                {
+                    "name": stage.name,
+                    "clip_length": stage.clip_length,
+                    "fixed_frames": stage.fixed_frames,
+                    "items": len(stage.items),
+                    "epochs": stage.epochs,
+                    "max_steps": stage.max_steps,
+                }
+                for stage in training_stages
+            ],
             "cache_stride": cache_stride,
             "lr": lr,
             "pose_weight": pose_weight,
@@ -536,277 +579,314 @@ def train_fixed_pose_student(
         )
 
     global_step = 0
-    for epoch in range(epochs):
-        if use_cache:
-            epoch_items: list[Any] = list(cached_clips)
-        else:
-            epoch_items = list(online_samples)
-        rng.shuffle(epoch_items)
-        epoch_losses: list[float] = []
+    for stage_index, stage in enumerate(training_stages):
+        print(
+            f"Starting curriculum stage {stage_index + 1}/{len(training_stages)}: "
+            f"name={stage.name} clip_length={stage.clip_length} "
+            f"fixed_frames={stage.fixed_frames if stage.fixed_frames is not None else 'auto-last'} "
+            f"items={len(stage.items)} max_steps={stage.max_steps if stage.max_steps is not None else 'full'}"
+        )
+        stage_losses: list[float] = []
+        stage_step = 0
+        for epoch in range(stage.epochs):
+            epoch_items: list[Any] = list(stage.items)
+            rng.shuffle(epoch_items)
+            epoch_losses: list[float] = []
 
-        for batch_start in range(0, len(epoch_items), batch_size):
-            if global_step >= max_steps:
-                break
-            batch_items = epoch_items[batch_start : batch_start + batch_size]
-            total_start = time.perf_counter()
-            batch_records: list[dict[str, Any]] = []
-            batch_losses: list[float] = []
-            batch_target_pose_losses: list[float] = []
-            batch_fixed_raw_pose_losses: list[float] = []
-            batch_token_losses: list[float] = []
-            batch_fixed_token_losses: list[float] = []
-            batch_target_token_losses: list[float] = []
-            batch_translation_losses: list[float] = []
-            batch_rotation_losses: list[float] = []
-            batch_fov_losses: list[float] = []
-            wandb_sample_images = None
-            wandb_sample_raw_pose = None
-            wandb_sample_teacher_pose = None
-            wandb_sample_fixed_frames = None
-            wandb_sample_caption = None
-            load_s = 0.0
-            teacher_s = 0.0
-            student_s = 0.0
-            backward_s = 0.0
+            for batch_start in range(0, len(epoch_items), batch_size):
+                if global_step >= max_steps or (stage.max_steps is not None and stage_step >= stage.max_steps):
+                    break
 
-            optimizer.zero_grad(set_to_none=True)
-            for item in batch_items:
-                item_load_start = time.perf_counter()
-                if use_cache:
-                    (
-                        images_cpu,
-                        frame_paths,
-                        teacher_pose_cpu,
-                        teacher_tokens_cpu,
-                        sequence_name,
-                        start,
-                        current_clip_length,
-                    ) = _load_cached_payload(item)
-                    if images_cpu is None:
-                        if not frame_paths:
-                            raise ValueError(f"Cached clip has no images or frame_paths: {item.path}")
-                        images = load_and_preprocess_images(frame_paths, image_resolution=image_resolution).to(device, non_blocking=True)
-                    else:
-                        images = images_cpu.to(device, non_blocking=True).float()
-                    teacher_pose = teacher_pose_cpu.to(device, non_blocking=True)
-                    teacher_tokens = (
-                        teacher_tokens_cpu.to(device, non_blocking=True).float()
-                        if teacher_tokens_cpu is not None
-                        else None
-                    )
-                    current_fixed_frames = current_clip_length - 1 if fixed_frames is None else fixed_frames
-                    if current_fixed_frames < 1 or current_fixed_frames >= current_clip_length:
-                        raise ValueError(
-                            f"fixed_frames={current_fixed_frames} is invalid for cached clip "
-                            f"length={current_clip_length}: {item.path}"
+                batch_items = epoch_items[batch_start : batch_start + batch_size]
+                total_start = time.perf_counter()
+                batch_records: list[dict[str, Any]] = []
+                batch_losses: list[float] = []
+                batch_target_pose_losses: list[float] = []
+                batch_fixed_raw_pose_losses: list[float] = []
+                batch_token_losses: list[float] = []
+                batch_fixed_token_losses: list[float] = []
+                batch_target_token_losses: list[float] = []
+                batch_translation_losses: list[float] = []
+                batch_rotation_losses: list[float] = []
+                batch_fov_losses: list[float] = []
+                wandb_sample_images = None
+                wandb_sample_raw_pose = None
+                wandb_sample_teacher_pose = None
+                wandb_sample_fixed_frames = None
+                wandb_sample_caption = None
+                load_s = 0.0
+                teacher_s = 0.0
+                student_s = 0.0
+                backward_s = 0.0
+
+                optimizer.zero_grad(set_to_none=True)
+                for item in batch_items:
+                    item_load_start = time.perf_counter()
+                    if use_cache:
+                        (
+                            images_cpu,
+                            frame_paths,
+                            teacher_pose_cpu,
+                            teacher_tokens_cpu,
+                            sequence_name,
+                            start,
+                            current_clip_length,
+                        ) = _load_cached_payload(item)
+                        if images_cpu is None:
+                            if not frame_paths:
+                                raise ValueError(f"Cached clip has no images or frame_paths: {item.path}")
+                            images = load_and_preprocess_images(
+                                frame_paths,
+                                image_resolution=image_resolution,
+                            ).to(device, non_blocking=True)
+                        else:
+                            images = images_cpu.to(device, non_blocking=True).float()
+                        teacher_pose = teacher_pose_cpu.to(device, non_blocking=True)
+                        teacher_tokens = (
+                            teacher_tokens_cpu.to(device, non_blocking=True).float()
+                            if teacher_tokens_cpu is not None
+                            else None
                         )
-                    item_teacher_s = 0.0
-                else:
-                    assert teacher is not None
-                    sample = item
-                    sequence = frame_sequences[sample.sequence_index]
-                    sequence_name = sequence.name
-                    start = sample.start
-                    clip_paths = sequence.frames[start : start + clip_length]
-                    images = load_and_preprocess_images(clip_paths, image_resolution=image_resolution).to(device, non_blocking=True)
-                    current_clip_length = clip_length
-                    current_fixed_frames = clip_length - 1 if fixed_frames is None else fixed_frames
-                    teacher_tokens = None
-                    item_teacher_s = 0.0
-                _sync_cuda(device)
-                item_load_s = time.perf_counter() - item_load_start
-                load_s += item_load_s
-
-                if not use_cache:
-                    teacher_start = time.perf_counter()
-                    with torch.no_grad():
-                        teacher_predictions = teacher(images)
-                        teacher_pose = teacher_predictions["pose_enc"].detach().clone()
-                        teacher_tokens = teacher_predictions["camera_and_register_tokens"].detach().clone()
+                        current_fixed_frames = current_clip_length - 1 if stage.fixed_frames is None else stage.fixed_frames
+                        if current_fixed_frames < 1 or current_fixed_frames >= current_clip_length:
+                            raise ValueError(
+                                f"fixed_frames={current_fixed_frames} is invalid for cached clip "
+                                f"length={current_clip_length}: {item.path}"
+                            )
+                        item_teacher_s = 0.0
+                    else:
+                        assert teacher is not None
+                        sample = item
+                        sequence = frame_sequences[sample.sequence_index]
+                        sequence_name = sequence.name
+                        start = sample.start
+                        current_clip_length = stage.clip_length
+                        clip_paths = sequence.frames[start : start + current_clip_length]
+                        images = load_and_preprocess_images(clip_paths, image_resolution=image_resolution).to(
+                            device,
+                            non_blocking=True,
+                        )
+                        current_fixed_frames = current_clip_length - 1 if stage.fixed_frames is None else stage.fixed_frames
+                        teacher_tokens = None
+                        item_teacher_s = 0.0
                     _sync_cuda(device)
-                    item_teacher_s = time.perf_counter() - teacher_start
-                    teacher_s += item_teacher_s
+                    item_load_s = time.perf_counter() - item_load_start
+                    load_s += item_load_s
 
-                fixed_pose_mask = torch.zeros(teacher_pose.shape[:2], dtype=torch.bool, device=device)
-                fixed_pose_mask[:, :current_fixed_frames] = True
+                    if not use_cache:
+                        teacher_start = time.perf_counter()
+                        with torch.no_grad():
+                            teacher_predictions = teacher(images)
+                            teacher_pose = teacher_predictions["pose_enc"].detach().clone()
+                            teacher_tokens = teacher_predictions["camera_and_register_tokens"].detach().clone()
+                        _sync_cuda(device)
+                        item_teacher_s = time.perf_counter() - teacher_start
+                        teacher_s += item_teacher_s
 
-                student_start = time.perf_counter()
-                predictions, _ = student.forward_incremental(
-                    images,
-                    None,
-                    fixed_pose_enc=teacher_pose,
-                    fixed_pose_mask=fixed_pose_mask,
-                )
-                raw_pose = predictions.get("pose_enc_model", predictions["pose_enc"])
-                target_pose_losses = _pose_loss(
-                    raw_pose[:, current_fixed_frames : current_fixed_frames + 1],
-                    teacher_pose[:, current_fixed_frames : current_fixed_frames + 1],
-                    pose_weight=pose_weight,
-                    translation_weight=translation_weight,
-                    rotation_weight=rotation_weight,
-                    fov_weight=fov_weight,
-                )
-                fixed_raw_pose_losses = _pose_loss(
-                    raw_pose[:, :current_fixed_frames],
-                    teacher_pose[:, :current_fixed_frames],
-                    pose_weight=fixed_raw_pose_weight,
-                    translation_weight=translation_weight,
-                    rotation_weight=rotation_weight,
-                    fov_weight=fov_weight,
-                )
-                token_losses = _token_loss(
-                    predictions.get("camera_and_register_tokens"),
-                    teacher_tokens,
-                    fixed_frames=current_fixed_frames,
-                    token_weight=token_weight,
-                    fixed_token_weight=fixed_token_weight,
-                    target_token_weight=target_token_weight,
-                    device=device,
-                )
-                loss = target_pose_losses.total + fixed_raw_pose_losses.total + token_losses.total
+                    fixed_pose_mask = torch.zeros(teacher_pose.shape[:2], dtype=torch.bool, device=device)
+                    fixed_pose_mask[:, :current_fixed_frames] = True
+
+                    student_start = time.perf_counter()
+                    predictions, _ = student.forward_incremental(
+                        images,
+                        None,
+                        fixed_pose_enc=teacher_pose,
+                        fixed_pose_mask=fixed_pose_mask,
+                    )
+                    raw_pose = predictions.get("pose_enc_model", predictions["pose_enc"])
+                    target_pose_losses = _pose_loss(
+                        raw_pose[:, current_fixed_frames : current_fixed_frames + 1],
+                        teacher_pose[:, current_fixed_frames : current_fixed_frames + 1],
+                        pose_weight=pose_weight,
+                        translation_weight=translation_weight,
+                        rotation_weight=rotation_weight,
+                        fov_weight=fov_weight,
+                    )
+                    fixed_raw_pose_losses = _pose_loss(
+                        raw_pose[:, :current_fixed_frames],
+                        teacher_pose[:, :current_fixed_frames],
+                        pose_weight=fixed_raw_pose_weight,
+                        translation_weight=translation_weight,
+                        rotation_weight=rotation_weight,
+                        fov_weight=fov_weight,
+                    )
+                    token_losses = _token_loss(
+                        predictions.get("camera_and_register_tokens"),
+                        teacher_tokens,
+                        fixed_frames=current_fixed_frames,
+                        token_weight=token_weight,
+                        fixed_token_weight=fixed_token_weight,
+                        target_token_weight=target_token_weight,
+                        device=device,
+                    )
+                    loss = target_pose_losses.total + fixed_raw_pose_losses.total + token_losses.total
+                    _sync_cuda(device)
+                    item_student_s = time.perf_counter() - student_start
+                    student_s += item_student_s
+                    if wandb_run is not None and wandb_sample_images is None and wandb_log_samples > 0:
+                        wandb_sample_images = images.detach().cpu()
+                        wandb_sample_raw_pose = raw_pose.detach().cpu()
+                        wandb_sample_teacher_pose = teacher_pose.detach().cpu()
+                        wandb_sample_fixed_frames = current_fixed_frames
+                        wandb_sample_caption = f"{sequence_name} start={start} fixed={current_fixed_frames}"
+
+                    backward_start = time.perf_counter()
+                    (loss / len(batch_items)).backward()
+                    _sync_cuda(device)
+                    item_backward_s = time.perf_counter() - backward_start
+                    backward_s += item_backward_s
+
+                    loss_value = float(loss.detach().cpu())
+                    target_pose_loss_value = float(target_pose_losses.total.detach().cpu())
+                    fixed_raw_pose_loss_value = float(fixed_raw_pose_losses.total.detach().cpu())
+                    token_loss_value = float(token_losses.total.detach().cpu())
+                    fixed_token_loss_value = float(token_losses.fixed.detach().cpu())
+                    target_token_loss_value = float(token_losses.target.detach().cpu())
+                    translation_loss_value = float(
+                        (target_pose_losses.translation + fixed_raw_pose_losses.translation).detach().cpu()
+                    )
+                    rotation_loss_value = float(
+                        (target_pose_losses.rotation + fixed_raw_pose_losses.rotation).detach().cpu()
+                    )
+                    fov_loss_value = float((target_pose_losses.fov + fixed_raw_pose_losses.fov).detach().cpu())
+                    batch_losses.append(loss_value)
+                    batch_target_pose_losses.append(target_pose_loss_value)
+                    batch_fixed_raw_pose_losses.append(fixed_raw_pose_loss_value)
+                    batch_token_losses.append(token_loss_value)
+                    batch_fixed_token_losses.append(fixed_token_loss_value)
+                    batch_target_token_losses.append(target_token_loss_value)
+                    batch_translation_losses.append(translation_loss_value)
+                    batch_rotation_losses.append(rotation_loss_value)
+                    batch_fov_losses.append(fov_loss_value)
+                    batch_records.append(
+                        {
+                            "sequence": sequence_name,
+                            "source_family": _source_family(sequence_name),
+                            "start": start,
+                            "clip_length": current_clip_length,
+                            "fixed_frames": current_fixed_frames,
+                            "load_s": item_load_s,
+                            "teacher_s": item_teacher_s,
+                            "student_s": item_student_s,
+                            "backward_s": item_backward_s,
+                            "pose_loss": loss_value,
+                            "target_pose_loss": target_pose_loss_value,
+                            "fixed_raw_pose_loss": fixed_raw_pose_loss_value,
+                            "token_loss": token_loss_value,
+                            "fixed_token_loss": fixed_token_loss_value,
+                            "target_token_loss": target_token_loss_value,
+                            "translation_loss": translation_loss_value,
+                            "rotation_loss": rotation_loss_value,
+                            "fov_loss": fov_loss_value,
+                        }
+                    )
+
+                step_start = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+                optimizer.step()
                 _sync_cuda(device)
-                item_student_s = time.perf_counter() - student_start
-                student_s += item_student_s
-                if wandb_run is not None and wandb_sample_images is None and wandb_log_samples > 0:
-                    wandb_sample_images = images.detach().cpu()
-                    wandb_sample_raw_pose = raw_pose.detach().cpu()
-                    wandb_sample_teacher_pose = teacher_pose.detach().cpu()
-                    wandb_sample_fixed_frames = current_fixed_frames
-                    wandb_sample_caption = f"{sequence_name} start={start} fixed={current_fixed_frames}"
+                backward_s += time.perf_counter() - step_start
 
-                backward_start = time.perf_counter()
-                (loss / len(batch_items)).backward()
-                _sync_cuda(device)
-                item_backward_s = time.perf_counter() - backward_start
-                backward_s += item_backward_s
-
-                loss_value = float(loss.detach().cpu())
-                target_pose_loss_value = float(target_pose_losses.total.detach().cpu())
-                fixed_raw_pose_loss_value = float(fixed_raw_pose_losses.total.detach().cpu())
-                token_loss_value = float(token_losses.total.detach().cpu())
-                fixed_token_loss_value = float(token_losses.fixed.detach().cpu())
-                target_token_loss_value = float(token_losses.target.detach().cpu())
-                translation_loss_value = float(
-                    (target_pose_losses.translation + fixed_raw_pose_losses.translation).detach().cpu()
-                )
-                rotation_loss_value = float(
-                    (target_pose_losses.rotation + fixed_raw_pose_losses.rotation).detach().cpu()
-                )
-                fov_loss_value = float((target_pose_losses.fov + fixed_raw_pose_losses.fov).detach().cpu())
-                batch_losses.append(loss_value)
-                batch_target_pose_losses.append(target_pose_loss_value)
-                batch_fixed_raw_pose_losses.append(fixed_raw_pose_loss_value)
-                batch_token_losses.append(token_loss_value)
-                batch_fixed_token_losses.append(fixed_token_loss_value)
-                batch_target_token_losses.append(target_token_loss_value)
-                batch_translation_losses.append(translation_loss_value)
-                batch_rotation_losses.append(rotation_loss_value)
-                batch_fov_losses.append(fov_loss_value)
-                batch_records.append(
-                    {
-                        "sequence": sequence_name,
-                        "start": start,
-                        "clip_length": current_clip_length,
-                        "fixed_frames": current_fixed_frames,
-                        "load_s": item_load_s,
-                        "teacher_s": item_teacher_s,
-                        "student_s": item_student_s,
-                        "backward_s": item_backward_s,
-                        "pose_loss": loss_value,
-                        "target_pose_loss": target_pose_loss_value,
-                        "fixed_raw_pose_loss": fixed_raw_pose_loss_value,
-                        "token_loss": token_loss_value,
-                        "fixed_token_loss": fixed_token_loss_value,
-                        "target_token_loss": target_token_loss_value,
-                        "translation_loss": translation_loss_value,
-                        "rotation_loss": rotation_loss_value,
-                        "fov_loss": fov_loss_value,
-                    }
-                )
-
-            step_start = time.perf_counter()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-            optimizer.step()
-            _sync_cuda(device)
-            backward_s += time.perf_counter() - step_start
-
-            loss_value = sum(batch_losses) / len(batch_losses)
-            target_pose_loss_value = sum(batch_target_pose_losses) / len(batch_target_pose_losses)
-            fixed_raw_pose_loss_value = sum(batch_fixed_raw_pose_losses) / len(batch_fixed_raw_pose_losses)
-            token_loss_value = sum(batch_token_losses) / len(batch_token_losses)
-            fixed_token_loss_value = sum(batch_fixed_token_losses) / len(batch_fixed_token_losses)
-            target_token_loss_value = sum(batch_target_token_losses) / len(batch_target_token_losses)
-            translation_loss_value = sum(batch_translation_losses) / len(batch_translation_losses)
-            rotation_loss_value = sum(batch_rotation_losses) / len(batch_rotation_losses)
-            fov_loss_value = sum(batch_fov_losses) / len(batch_fov_losses)
-            epoch_losses.append(loss_value)
-            loss_history.append(loss_value)
-            total_s = time.perf_counter() - total_start
-            record = {
-                "step": global_step,
-                "epoch": epoch,
-                "sequence": ",".join(str(item["sequence"]) for item in batch_records),
-                "start": ",".join(str(item["start"]) for item in batch_records),
-                "batch_size": len(batch_items),
-                "clip_length": batch_records[0]["clip_length"],
-                "fixed_frames": batch_records[0]["fixed_frames"],
-                "load_s": load_s,
-                "teacher_s": teacher_s,
-                "student_s": student_s,
-                "backward_s": backward_s,
-                "total_s": total_s,
-                "pose_loss": loss_value,
-                "target_pose_loss": target_pose_loss_value,
-                "fixed_raw_pose_loss": fixed_raw_pose_loss_value,
-                "token_loss": token_loss_value,
-                "fixed_token_loss": fixed_token_loss_value,
-                "target_token_loss": target_token_loss_value,
-                "translation_loss": translation_loss_value,
-                "rotation_loss": rotation_loss_value,
-                "fov_loss": fov_loss_value,
-                "samples": batch_records,
-            }
-            profiles.append(record)
-            if wandb_run is not None:
-                wandb_metrics = _wandb_scalar_metrics(record, lr=lr)
-                wandb_run.log(wandb_metrics, step=global_step)
-                should_log_wandb_samples = (
+                loss_value = sum(batch_losses) / len(batch_losses)
+                target_pose_loss_value = sum(batch_target_pose_losses) / len(batch_target_pose_losses)
+                fixed_raw_pose_loss_value = sum(batch_fixed_raw_pose_losses) / len(batch_fixed_raw_pose_losses)
+                token_loss_value = sum(batch_token_losses) / len(batch_token_losses)
+                fixed_token_loss_value = sum(batch_fixed_token_losses) / len(batch_fixed_token_losses)
+                target_token_loss_value = sum(batch_target_token_losses) / len(batch_target_token_losses)
+                translation_loss_value = sum(batch_translation_losses) / len(batch_translation_losses)
+                rotation_loss_value = sum(batch_rotation_losses) / len(batch_rotation_losses)
+                fov_loss_value = sum(batch_fov_losses) / len(batch_fov_losses)
+                epoch_losses.append(loss_value)
+                loss_history.append(loss_value)
+                total_s = time.perf_counter() - total_start
+                record = {
+                    "step": global_step,
+                    "stage": stage.name,
+                    "stage_index": stage_index,
+                    "stage_step": stage_step,
+                    "epoch": epoch,
+                    "sequence": ",".join(str(item["sequence"]) for item in batch_records),
+                    "start": ",".join(str(item["start"]) for item in batch_records),
+                    "batch_size": len(batch_items),
+                    "clip_length": batch_records[0]["clip_length"],
+                    "fixed_frames": batch_records[0]["fixed_frames"],
+                    "load_s": load_s,
+                    "teacher_s": teacher_s,
+                    "student_s": student_s,
+                    "backward_s": backward_s,
+                    "total_s": total_s,
+                    "pose_loss": loss_value,
+                    "target_pose_loss": target_pose_loss_value,
+                    "fixed_raw_pose_loss": fixed_raw_pose_loss_value,
+                    "token_loss": token_loss_value,
+                    "fixed_token_loss": fixed_token_loss_value,
+                    "target_token_loss": target_token_loss_value,
+                    "translation_loss": translation_loss_value,
+                    "rotation_loss": rotation_loss_value,
+                    "fov_loss": fov_loss_value,
+                    "samples": batch_records,
+                    "source_loss": _summarize_batch_records_by_source(batch_records),
+                }
+                profiles.append(record)
+                if wandb_run is not None:
+                    wandb_metrics = _wandb_scalar_metrics(record, lr=lr)
+                    wandb_run.log(wandb_metrics, step=global_step)
+                    should_log_wandb_samples = (
+                        global_step == 0
+                        or (global_step + 1) % max(wandb_log_every, 1) == 0
+                        or global_step + 1 == max_steps
+                    )
+                    if should_log_wandb_samples and wandb_sample_images is not None:
+                        sample_payload = _wandb_intermediate_payload(
+                            wandb_module,
+                            images=wandb_sample_images,
+                            raw_pose=wandb_sample_raw_pose,
+                            teacher_pose=wandb_sample_teacher_pose,
+                            fixed_frames=int(wandb_sample_fixed_frames),
+                            caption=str(wandb_sample_caption),
+                        )
+                        if sample_payload:
+                            wandb_run.log(sample_payload, step=global_step)
+                should_log = (
                     global_step == 0
-                    or (global_step + 1) % max(wandb_log_every, 1) == 0
+                    or (global_step + 1) % max(log_every, 1) == 0
                     or global_step + 1 == max_steps
                 )
-                if should_log_wandb_samples and wandb_sample_images is not None:
-                    sample_payload = _wandb_intermediate_payload(
-                        wandb_module,
-                        images=wandb_sample_images,
-                        raw_pose=wandb_sample_raw_pose,
-                        teacher_pose=wandb_sample_teacher_pose,
-                        fixed_frames=int(wandb_sample_fixed_frames),
-                        caption=str(wandb_sample_caption),
+                if should_log:
+                    window = loss_history[-max(log_every, 1) :]
+                    print(
+                        f"step={global_step:04d} epoch={epoch} stage={record['stage']} "
+                        f"stage_step={stage_step} seq={record['sequence']} start={record['start']} "
+                        f"batch={len(batch_items)} clip={record['clip_length']} fixed={record['fixed_frames']} "
+                        f"loss={loss_value:.6f} loss_avg{len(window)}={sum(window) / len(window):.6f} "
+                        f"target={target_pose_loss_value:.6f} fixed_raw={fixed_raw_pose_loss_value:.6f} "
+                        f"token={token_loss_value:.6f} token_fixed={fixed_token_loss_value:.6f} "
+                        f"token_target={target_token_loss_value:.6f} "
+                        f"t={translation_loss_value:.6f} r={rotation_loss_value:.6f} fov={fov_loss_value:.6f} "
+                        f"load={load_s:.3f}s teacher={teacher_s:.3f}s "
+                        f"student={student_s:.3f}s backward={backward_s:.3f}s total={total_s:.3f}s"
                     )
-                    if sample_payload:
-                        wandb_run.log(sample_payload, step=global_step)
-            should_log = global_step == 0 or (global_step + 1) % max(log_every, 1) == 0 or global_step + 1 == max_steps
-            if should_log:
-                window = loss_history[-max(log_every, 1) :]
-                print(
-                    f"step={global_step:04d} epoch={epoch} seq={record['sequence']} start={record['start']} "
-                    f"batch={len(batch_items)} clip={record['clip_length']} fixed={record['fixed_frames']} "
-                    f"loss={loss_value:.6f} loss_avg{len(window)}={sum(window) / len(window):.6f} "
-                    f"target={target_pose_loss_value:.6f} fixed_raw={fixed_raw_pose_loss_value:.6f} "
-                    f"token={token_loss_value:.6f} token_fixed={fixed_token_loss_value:.6f} "
-                    f"token_target={target_token_loss_value:.6f} "
-                    f"t={translation_loss_value:.6f} r={rotation_loss_value:.6f} fov={fov_loss_value:.6f} "
-                    f"load={load_s:.3f}s teacher={teacher_s:.3f}s "
-                    f"student={student_s:.3f}s backward={backward_s:.3f}s total={total_s:.3f}s"
-                )
-            global_step += 1
+                global_step += 1
+                stage_step += 1
 
-        if epoch_losses:
+            if epoch_losses:
+                print(
+                    f"stage={stage.name} epoch={epoch} steps={len(epoch_losses)} "
+                    f"loss_mean={sum(epoch_losses) / len(epoch_losses):.6f} "
+                    f"loss_first={epoch_losses[0]:.6f} loss_last={epoch_losses[-1]:.6f}"
+                )
+            stage_losses.extend(epoch_losses)
+            if global_step >= max_steps or (stage.max_steps is not None and stage_step >= stage.max_steps):
+                break
+
+        if stage_losses:
             print(
-                f"epoch={epoch} steps={len(epoch_losses)} loss_mean={sum(epoch_losses) / len(epoch_losses):.6f} "
-                f"loss_first={epoch_losses[0]:.6f} loss_last={epoch_losses[-1]:.6f}"
+                f"stage={stage.name} total_steps={len(stage_losses)} "
+                f"loss_mean={sum(stage_losses) / len(stage_losses):.6f} "
+                f"loss_first={stage_losses[0]:.6f} loss_last={stage_losses[-1]:.6f}"
             )
+        if global_step >= max_steps:
+            break
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -844,6 +924,19 @@ def train_fixed_pose_student(
                 "epochs": epochs,
                 "clip_length": clip_length,
                 "fixed_frames": fixed_frames,
+                "curriculum_clip_lengths": curriculum_clip_lengths,
+                "curriculum_steps_per_stage": curriculum_steps_per_stage,
+                "training_stages": [
+                    {
+                        "name": stage.name,
+                        "clip_length": stage.clip_length,
+                        "fixed_frames": stage.fixed_frames,
+                        "items": len(stage.items),
+                        "epochs": stage.epochs,
+                        "max_steps": stage.max_steps,
+                    }
+                    for stage in training_stages
+                ],
                 "cache_stride": cache_stride,
                 "lr": lr,
                 "pose_weight": pose_weight,
@@ -1046,6 +1139,102 @@ def _count_by_clip_length(clips: list[CachedClip]) -> dict[str, int]:
     return counts
 
 
+def _build_training_stages(
+    items: list[Any],
+    *,
+    use_cache: bool,
+    frame_sequences: list[FrameSequence],
+    clip_length: int,
+    fixed_frames: int | None,
+    curriculum_clip_lengths: list[int],
+    curriculum_steps_per_stage: list[int],
+    epochs: int,
+    batch_size: int,
+) -> list[TrainingStage]:
+    del batch_size
+    if not curriculum_clip_lengths:
+        if use_cache:
+            if fixed_frames is not None:
+                lengths = sorted({int(item.clip_length) for item in items})
+                invalid = [length for length in lengths if fixed_frames < 1 or fixed_frames >= length]
+                if invalid:
+                    raise ValueError(f"fixed_frames={fixed_frames} is invalid for cached clip lengths {invalid}.")
+        else:
+            if fixed_frames is not None and (fixed_frames < 1 or fixed_frames >= clip_length):
+                raise ValueError("fixed_frames must be in [1, clip_length - 1].")
+        return [
+            TrainingStage(
+                name=f"L{clip_length}_fixed{fixed_frames if fixed_frames is not None else 'auto'}",
+                clip_length=clip_length,
+                fixed_frames=fixed_frames,
+                items=items,
+                epochs=epochs,
+                max_steps=None,
+            )
+        ]
+
+    stages: list[TrainingStage] = []
+    for index, length in enumerate(curriculum_clip_lengths):
+        stage_fixed_frames = fixed_frames if fixed_frames is not None else length - 1
+        if stage_fixed_frames < 1 or stage_fixed_frames >= length:
+            raise ValueError(f"Curriculum stage length={length} has invalid fixed_frames={stage_fixed_frames}.")
+        if use_cache:
+            stage_items = [item for item in items if int(item.clip_length) == length]
+        else:
+            stage_items = _build_clip_index(frame_sequences, length, stride=1)
+        if not stage_items:
+            raise ValueError(f"No training items are available for curriculum clip length {length}.")
+        stages.append(
+            TrainingStage(
+                name=f"{stage_fixed_frames}+1_L{length}",
+                clip_length=length,
+                fixed_frames=stage_fixed_frames,
+                items=stage_items,
+                epochs=epochs,
+                max_steps=curriculum_steps_per_stage[index] if curriculum_steps_per_stage else None,
+            )
+        )
+    return stages
+
+
+def _planned_stage_steps(stage: TrainingStage, batch_size: int) -> int:
+    full_steps = stage.epochs * ((len(stage.items) + batch_size - 1) // batch_size)
+    return min(full_steps, stage.max_steps) if stage.max_steps is not None else full_steps
+
+
+def _source_family(sequence_name: str) -> str:
+    if sequence_name.startswith("MH_"):
+        return "eth"
+    if sequence_name.startswith("rgbd_dataset_"):
+        return "tum"
+    if sequence_name in {"office", "apartment_images", "building_images"}:
+        return "mit"
+    if sequence_name.startswith("DJI_"):
+        return "dji"
+    return "other"
+
+
+def _summarize_batch_records_by_source(batch_records: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in batch_records:
+        grouped.setdefault(str(record["source_family"]), []).append(record)
+    summary: dict[str, dict[str, float]] = {}
+    for source, records in grouped.items():
+        source_summary: dict[str, float] = {"count": float(len(records))}
+        for key in (
+            "pose_loss",
+            "target_pose_loss",
+            "fixed_raw_pose_loss",
+            "token_loss",
+            "translation_loss",
+            "rotation_loss",
+            "fov_loss",
+        ):
+            source_summary[key] = sum(float(record[key]) for record in records) / len(records)
+        summary[source] = source_summary
+    return summary
+
+
 def _load_frame_sequences(inputs: list[str]) -> list[FrameSequence]:
     pending: list[tuple[str, str, list[str]]] = []
     for item in inputs:
@@ -1167,7 +1356,7 @@ def _init_wandb(
 
 
 def _wandb_scalar_metrics(record: dict[str, Any], *, lr: float) -> dict[str, float | int]:
-    return {
+    metrics: dict[str, float | int] = {
         "train/loss": float(record["pose_loss"]),
         "train/target_pose_loss": float(record["target_pose_loss"]),
         "train/fixed_raw_pose_loss": float(record["fixed_raw_pose_loss"]),
@@ -1183,9 +1372,17 @@ def _wandb_scalar_metrics(record: dict[str, Any], *, lr: float) -> dict[str, flo
         "profile/backward_s": float(record["backward_s"]),
         "profile/total_s": float(record["total_s"]),
         "train/epoch": int(record["epoch"]),
+        "train/stage_index": int(record["stage_index"]),
+        "train/stage_step": int(record["stage_step"]),
+        "train/stage_clip_length": int(record["clip_length"]),
+        "train/stage_fixed_frames": int(record["fixed_frames"]),
         "train/batch_size": int(record["batch_size"]),
         "train/lr": float(lr),
     }
+    for source, source_values in record.get("source_loss", {}).items():
+        for key, value in source_values.items():
+            metrics[f"train/source/{source}_{key}"] = float(value)
+    return metrics
 
 
 def _wandb_intermediate_payload(
@@ -1345,6 +1542,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--clip-length", type=int, default=5)
     parser.add_argument("--fixed-frames", type=int, help="Number of fixed history frames. Defaults to clip_length - 1 for each clip.")
+    parser.add_argument(
+        "--curriculum-clip-lengths",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Train sequential fixed-pose stages, e.g. 2 3 4 5 means 1+1, 2+1, 3+1, 4+1.",
+    )
+    parser.add_argument(
+        "--curriculum-steps-per-stage",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Optional cap for each curriculum stage; must match --curriculum-clip-lengths.",
+    )
     parser.add_argument("--cache-stride", type=int, default=1)
     parser.add_argument("--teacher-window-length", type=int, default=100)
     parser.add_argument(
@@ -1456,6 +1667,8 @@ def main() -> None:
         epochs=args.epochs,
         clip_length=args.clip_length,
         fixed_frames=args.fixed_frames,
+        curriculum_clip_lengths=args.curriculum_clip_lengths,
+        curriculum_steps_per_stage=args.curriculum_steps_per_stage,
         cache_stride=args.cache_stride,
         lr=args.lr,
         pose_weight=args.pose_weight,

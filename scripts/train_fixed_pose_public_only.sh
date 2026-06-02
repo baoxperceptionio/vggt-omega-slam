@@ -4,24 +4,27 @@ set -euo pipefail
 CONFIG_JSON="${CONFIG_JSON:-/app/configs/fixed_pose_deep_token_public_sources.json}"
 TEACHER_CHECKPOINT="${TEACHER_CHECKPOINT:-/app/checkpoints/VGGT-Omega-1B-512/model.pt}"
 STUDENT_INIT_CHECKPOINT="${STUDENT_INIT_CHECKPOINT:-}"
-OUTPUT_CHECKPOINT="${OUTPUT_CHECKPOINT:-/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_tum_eth_mit_epoch1.pt}"
-PROFILE_OUTPUT="${PROFILE_OUTPUT:-/tmp/vggt_fixed_pose_ft/profile_tum_eth_mit_epoch1.json}"
+OUTPUT_CHECKPOINT="${OUTPUT_CHECKPOINT:-/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_tum_eth_mit_curriculum_epoch1.pt}"
+PROFILE_OUTPUT="${PROFILE_OUTPUT:-/tmp/vggt_fixed_pose_ft/profile_tum_eth_mit_curriculum_epoch1.json}"
 
-TUM_CACHE="${TUM_CACHE:-/app/outputs/teacher_cache/cache_public_rgb_w100_sub5_tokens}"
-ETH_CACHE="${ETH_CACHE:-/app/outputs/teacher_cache/cache_eth_cam0_w100_sub5_tokens}"
-MIT_CACHE="${MIT_CACHE:-/app/outputs/teacher_cache/cache_mit_jpg_w100_sub5_tokens}"
+TUM_CACHE="${TUM_CACHE:-/app/outputs/teacher_cache/cache_public_rgb_w100_sub2_3_4_5_tokens}"
+ETH_CACHE="${ETH_CACHE:-/app/outputs/teacher_cache/cache_eth_cam0_w100_sub2_3_4_5_tokens}"
+MIT_CACHE="${MIT_CACHE:-/app/outputs/teacher_cache/cache_mit_jpg_w100_sub2_3_4_5_tokens}"
 
 IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-512}"
 TEACHER_WINDOW_LENGTH="${TEACHER_WINDOW_LENGTH:-100}"
 EPOCHS="${EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-3}"
-LR="${LR:-3e-6}"
+LR="${LR:-8e-6}"
 TOKEN_WEIGHT="${TOKEN_WEIGHT:-0.1}"
 LOG_EVERY="${LOG_EVERY:-25}"
 DEVICE="${DEVICE:-cuda}"
+SUBCLIP_LENGTHS=(${SUBCLIP_LENGTHS:-2 3 4 5})
+CURRICULUM_CLIP_LENGTHS=(${CURRICULUM_CLIP_LENGTHS:-2 3 4 5})
+CURRICULUM_STEPS_PER_STAGE=(${CURRICULUM_STEPS_PER_STAGE:-})
 WANDB="${WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-vggt-fixed-pose}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-fixed-pose-public-only-tum-eth-mit-epoch1}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-fixed-pose-public-only-curriculum-lr8e-6-epoch1}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_LOG_EVERY="${WANDB_LOG_EVERY:-25}"
 WANDB_LOG_SAMPLES="${WANDB_LOG_SAMPLES:-1}"
@@ -48,6 +51,24 @@ MIT_JPG_DIRS=(
 )
 
 echo "Using config record: ${CONFIG_JSON}"
+echo "Curriculum subclip lengths: ${SUBCLIP_LENGTHS[*]}"
+echo "Training curriculum clip lengths: ${CURRICULUM_CLIP_LENGTHS[*]}"
+echo "Preparing TUM RGB-D teacher-token cache at ${TUM_CACHE}"
+python scripts/train_fixed_pose_student.py \
+  "${TUM_RGBD_DIRS[@]}" \
+  --teacher-checkpoint "${TEACHER_CHECKPOINT}" \
+  --output /tmp/vggt_fixed_pose_ft/checkpoints/tum_cache_prepare_dummy.pt \
+  --teacher-cache-dir "${TUM_CACHE}" \
+  --prepare-global-window-cache \
+  --cache-only \
+  --image-resolution "${IMAGE_RESOLUTION}" \
+  --teacher-window-length "${TEACHER_WINDOW_LENGTH}" \
+  --subclip-lengths "${SUBCLIP_LENGTHS[@]}" \
+  --subclip-stride 1 \
+  --cache-teacher-tokens \
+  --device "${DEVICE}" \
+  --log-every 1
+
 echo "Preparing ETH cam0 teacher-token cache at ${ETH_CACHE}"
 python scripts/train_fixed_pose_student.py \
   "${ETH_CAM0_DIRS[@]}" \
@@ -58,7 +79,7 @@ python scripts/train_fixed_pose_student.py \
   --cache-only \
   --image-resolution "${IMAGE_RESOLUTION}" \
   --teacher-window-length "${TEACHER_WINDOW_LENGTH}" \
-  --subclip-lengths 5 \
+  --subclip-lengths "${SUBCLIP_LENGTHS[@]}" \
   --subclip-stride 1 \
   --cache-teacher-tokens \
   --device "${DEVICE}" \
@@ -74,7 +95,7 @@ python scripts/train_fixed_pose_student.py \
   --cache-only \
   --image-resolution "${IMAGE_RESOLUTION}" \
   --teacher-window-length "${TEACHER_WINDOW_LENGTH}" \
-  --subclip-lengths 5 \
+  --subclip-lengths "${SUBCLIP_LENGTHS[@]}" \
   --subclip-stride 1 \
   --cache-teacher-tokens \
   --device "${DEVICE}" \
@@ -94,6 +115,7 @@ train_args=(
   --epochs "${EPOCHS}"
   --batch-size "${BATCH_SIZE}"
   --lr "${LR}"
+  --curriculum-clip-lengths "${CURRICULUM_CLIP_LENGTHS[@]}"
   --token-weight "${TOKEN_WEIGHT}"
   --fixed-token-weight 1.0
   --target-token-weight 1.0
@@ -102,6 +124,10 @@ train_args=(
   --device "${DEVICE}"
   --log-every "${LOG_EVERY}"
 )
+
+if [[ "${#CURRICULUM_STEPS_PER_STAGE[@]}" -gt 0 ]]; then
+  train_args+=(--curriculum-steps-per-stage "${CURRICULUM_STEPS_PER_STAGE[@]}")
+fi
 
 if [[ -n "${STUDENT_INIT_CHECKPOINT}" ]]; then
   echo "Training public-only from student init checkpoint: ${STUDENT_INIT_CHECKPOINT}"
@@ -119,7 +145,7 @@ if [[ "${WANDB}" != "0" ]]; then
     --wandb-mode "${WANDB_MODE}"
     --wandb-log-every "${WANDB_LOG_EVERY}"
     --wandb-log-samples "${WANDB_LOG_SAMPLES}"
-    --wandb-tags fixed-pose public-only tum eth mit
+    --wandb-tags fixed-pose public-only tum eth mit curriculum lr8e-6
   )
 fi
 
