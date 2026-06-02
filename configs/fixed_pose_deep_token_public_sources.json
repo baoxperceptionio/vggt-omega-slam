@@ -1,0 +1,167 @@
+{
+  "name": "fixed_pose_deep_token_public_continued_training",
+  "description": "Continue fixed-pose deep-token distillation from the DJI-trained checkpoint using DJI 2FPS frame cache plus public_data/*/rgb teacher-token cache.",
+  "created_for": "Reproducible fixed-pose FT with 5-frame subclips, first 4 frames fixed, 5th frame supervised.",
+  "teacher_checkpoint_container": "/app/checkpoints/VGGT-Omega-1B-512/model.pt",
+  "student_init_checkpoint_container": "/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_deep_token_epoch1.pt",
+  "output_checkpoint_container": "/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_deep_token_public_epoch1.pt",
+  "profile_output_container": "/tmp/vggt_fixed_pose_ft/profile_deep_token_public_epoch1.json",
+  "public_only_output_checkpoint_container": "/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_tum_eth_mit_epoch1.pt",
+  "public_only_profile_output_container": "/tmp/vggt_fixed_pose_ft/profile_tum_eth_mit_epoch1.json",
+  "image_resolution": 512,
+  "teacher_cache": {
+    "teacher_window_length": 100,
+    "teacher_window_stride": 96,
+    "subclip_lengths": [5],
+    "subclip_stride": 1,
+    "canonicalize_subclips": false,
+    "cache_teacher_tokens": true,
+    "dji_cache_container": "/app/outputs/teacher_cache/cache_global_w100_sub5_tokens",
+    "public_rgb_cache_container": "/app/outputs/teacher_cache/cache_public_rgb_w100_sub5_tokens",
+    "candidate_eth_cam0_cache_container": "/app/outputs/teacher_cache/cache_eth_cam0_w100_sub5_tokens",
+    "candidate_mit_jpg_cache_container": "/app/outputs/teacher_cache/cache_mit_jpg_w100_sub5_tokens"
+  },
+  "training": {
+    "epochs": 1,
+    "batch_size": 3,
+    "lr": 0.000003,
+    "token_weight": 0.1,
+    "fixed_token_weight": 1.0,
+    "target_token_weight": 1.0,
+    "fixed_raw_pose_weight": 1.0,
+    "freeze_backbone": true,
+    "device": "cuda",
+    "log_every": 25,
+    "wandb": {
+      "enabled_by_default_in_public_only_script": true,
+      "project": "vggt-fixed-pose",
+      "run_name": "fixed-pose-public-only-tum-eth-mit-epoch1",
+      "mode": "online",
+      "log_every": 25,
+      "log_samples": 1,
+      "api_key_env": "WANDB_API_KEY",
+      "note": "The API key is intentionally not stored in this repository; pass it as an environment variable when launching training."
+    }
+  },
+  "source_data": {
+    "dji_videos_host": [
+      "/home/ubuntu/3d/DJI_0005.MP4",
+      "/home/ubuntu/3d/DJI_0010.MP4"
+    ],
+    "dji_extracted_frames_container": [
+      {
+        "path": "/app/outputs/teacher_cache/frames_exhaustive5/DJI_0005",
+        "sampling": "2 FPS extracted from /home/ubuntu/3d/DJI_0005.MP4",
+        "num_images_observed_on_2026_06_02": 1246
+      },
+      {
+        "path": "/app/outputs/teacher_cache/frames_exhaustive5/DJI_0010",
+        "sampling": "2 FPS extracted from /home/ubuntu/3d/DJI_0010.MP4",
+        "num_images_observed_on_2026_06_02": 2170
+      }
+    ],
+    "tum_rgbd_dirs": [
+      {
+        "path": "/app/public_data/tum/rgbd_dataset_freiburg2_pioneer_360/rgb",
+        "num_images_observed_on_2026_06_02": 1225
+      },
+      {
+        "path": "/app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam/rgb",
+        "num_images_observed_on_2026_06_02": 2921
+      },
+      {
+        "path": "/app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam2/rgb",
+        "num_images_observed_on_2026_06_02": 2113
+      },
+      {
+        "path": "/app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam3/rgb",
+        "num_images_observed_on_2026_06_02": 2544
+      }
+    ],
+    "candidate_eth_cam0_dirs_container": [
+      {
+        "path": "/app/public_data/eth/machine_hall/MH_01_easy/mav0/cam0/data",
+        "dataset_format": "EuRoC MAV cam0 image stream",
+        "glob": "/app/public_data/eth/*/*/mav0/cam0/data/*.png",
+        "camera": "mav0/cam0",
+        "image_format": "PNG grayscale, PIL mode L, 752x480",
+        "filename_format": "<timestamp_ns>.png",
+        "nominal_rate_hz_from_timestamp": 20,
+        "num_images_observed_on_2026_06_02": 3682
+      },
+      {
+        "path": "/app/public_data/eth/machine_hall/MH_02_easy/mav0/cam0/data",
+        "dataset_format": "EuRoC MAV cam0 image stream",
+        "glob": "/app/public_data/eth/*/*/mav0/cam0/data/*.png",
+        "camera": "mav0/cam0",
+        "image_format": "PNG grayscale, PIL mode L, 752x480",
+        "filename_format": "<timestamp_ns>.png",
+        "nominal_rate_hz_from_timestamp": 20,
+        "num_images_observed_on_2026_06_02": 3040
+      },
+      {
+        "path": "/app/public_data/eth/machine_hall/MH_03_medium/mav0/cam0/data",
+        "dataset_format": "EuRoC MAV cam0 image stream",
+        "glob": "/app/public_data/eth/*/*/mav0/cam0/data/*.png",
+        "camera": "mav0/cam0",
+        "image_format": "PNG grayscale, PIL mode L, 752x480",
+        "filename_format": "<timestamp_ns>.png",
+        "nominal_rate_hz_from_timestamp": 20,
+        "num_images_observed_on_2026_06_02": 2700
+      },
+      {
+        "path": "/app/public_data/eth/machine_hall/MH_04_difficult/mav0/cam0/data",
+        "dataset_format": "EuRoC MAV cam0 image stream",
+        "glob": "/app/public_data/eth/*/*/mav0/cam0/data/*.png",
+        "camera": "mav0/cam0",
+        "image_format": "PNG grayscale, PIL mode L, 752x480",
+        "filename_format": "<timestamp_ns>.png",
+        "nominal_rate_hz_from_timestamp": 20,
+        "num_images_observed_on_2026_06_02": 2033
+      },
+      {
+        "path": "/app/public_data/eth/machine_hall/MH_05_difficult/mav0/cam0/data",
+        "dataset_format": "EuRoC MAV cam0 image stream",
+        "glob": "/app/public_data/eth/*/*/mav0/cam0/data/*.png",
+        "camera": "mav0/cam0",
+        "image_format": "PNG grayscale, PIL mode L, 752x480",
+        "filename_format": "<timestamp_ns>.png",
+        "nominal_rate_hz_from_timestamp": 20,
+        "num_images_observed_on_2026_06_02": 2273
+      }
+    ],
+    "candidate_mit_jpg_dirs_container": [
+      {
+        "path": "/app/public_data/mit/office",
+        "dataset_format": "MIT office RGB JPEG sequence",
+        "glob": "/app/public_data/mit/*/*.jpg",
+        "image_format": "JPEG RGB, PIL mode RGB, 640x480",
+        "filename_format": "rgb_<frame_index>.jpg",
+        "frame_index_range_observed_on_2026_06_02": [0, 1459],
+        "frame_indices_are_contiguous": true,
+        "num_images_observed_on_2026_06_02": 1460
+      },
+      {
+        "path": "/app/public_data/mit/apartment/images",
+        "dataset_format": "MIT apartment RGB JPEG sequence",
+        "glob": "/app/public_data/mit/apartment/images/*.jpg",
+        "image_format": "JPEG RGB, PIL mode RGB, 640x480",
+        "filename_format": "rgb_<frame_index>.jpg",
+        "frame_index_range_observed_on_2026_06_02": [0, 1075],
+        "frame_indices_are_contiguous": false,
+        "num_missing_frame_indices_observed_on_2026_06_02": 20,
+        "num_images_observed_on_2026_06_02": 1056
+      },
+      {
+        "path": "/app/public_data/mit/building/images",
+        "dataset_format": "MIT building RGB JPEG sequence",
+        "glob": "/app/public_data/mit/building/images/*.jpg",
+        "image_format": "JPEG RGB, PIL mode RGB, 640x480",
+        "filename_format": "rgb_<frame_index>.jpg",
+        "frame_index_range_observed_on_2026_06_02": [0, 3842],
+        "frame_indices_are_contiguous": true,
+        "num_images_observed_on_2026_06_02": 3843
+      }
+    ]
+  }
+}

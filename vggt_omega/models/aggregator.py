@@ -411,8 +411,26 @@ class CausalAggregator(Aggregator):
                 self.inter_frame_attention_types[block_idx],
                 layer_kv_cache,
             )
+            tokens = self.fixed_pose_conditioner.condition_tokens(
+                tokens,
+                fixed_pose_enc=fixed_pose_enc,
+                fixed_pose_mask=fixed_pose_mask,
+                batch_size=batch_size,
+                num_frames=num_frames,
+                num_tokens=num_tokens,
+                patch_token_start=self.patch_token_start,
+                projection="deep",
+            )
             if block_idx in self.cached_layer_indices:
-                outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
+                tokens_for_cache = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+                cached_tokens = torch.cat([frame_tokens, tokens_for_cache], dim=-1)
+                cached_tokens = self.fixed_pose_conditioner.condition_cached_output(
+                    cached_tokens,
+                    fixed_pose_enc=fixed_pose_enc,
+                    fixed_pose_mask=fixed_pose_mask,
+                    patch_token_start=self.patch_token_start,
+                )
+                outputs.append(cached_tokens)
             else:
                 outputs.append(None)
 
@@ -498,10 +516,17 @@ class FixedPoseConditioner(nn.Module):
 
     def __init__(self, pose_dim: int, embed_dim: int) -> None:
         super().__init__()
+        self.embed_dim = embed_dim
         self.pose_norm = nn.LayerNorm(pose_dim)
         self.pose_proj = nn.Linear(pose_dim, embed_dim)
+        self.deep_pose_proj = nn.Linear(pose_dim, embed_dim)
+        self.cached_pose_proj = nn.Linear(pose_dim, 2 * embed_dim)
         nn.init.zeros_(self.pose_proj.weight)
         nn.init.zeros_(self.pose_proj.bias)
+        nn.init.zeros_(self.deep_pose_proj.weight)
+        nn.init.zeros_(self.deep_pose_proj.bias)
+        nn.init.zeros_(self.cached_pose_proj.weight)
+        nn.init.zeros_(self.cached_pose_proj.bias)
 
     def forward(
         self,
@@ -537,14 +562,107 @@ class FixedPoseConditioner(nn.Module):
                 f"({batch_size}, {num_frames}), got {tuple(fixed_pose_mask.shape)}."
             )
 
-        fixed_pose_enc = fixed_pose_enc.to(device=tokens.device, dtype=torch.float32)
-        fixed_pose_mask = fixed_pose_mask.to(device=tokens.device, dtype=torch.bool)
-        pose_delta = self.pose_proj(self.pose_norm(fixed_pose_enc)).to(dtype=tokens.dtype)
-        pose_delta = pose_delta * fixed_pose_mask.unsqueeze(-1).to(dtype=pose_delta.dtype)
+        return self.condition_tokens(
+            tokens,
+            fixed_pose_enc=fixed_pose_enc,
+            fixed_pose_mask=fixed_pose_mask,
+            batch_size=batch_size,
+            num_frames=num_frames,
+            num_tokens=num_tokens,
+            patch_token_start=patch_token_start,
+            projection="input",
+        )
 
+    def condition_tokens(
+        self,
+        tokens: torch.Tensor,
+        *,
+        fixed_pose_enc: torch.Tensor | None,
+        fixed_pose_mask: torch.Tensor | None,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        patch_token_start: int,
+        projection: str,
+    ) -> torch.Tensor:
+        if fixed_pose_enc is None:
+            return tokens
+
+        if projection == "input":
+            pose_proj = self.pose_proj
+        elif projection == "deep":
+            pose_proj = self.deep_pose_proj
+        else:
+            raise ValueError(f"Unknown fixed-pose token projection: {projection}")
+
+        pose_delta = self._project_pose_delta(
+            fixed_pose_enc,
+            fixed_pose_mask,
+            pose_proj=pose_proj,
+            tokens=tokens,
+            batch_size=batch_size,
+            num_frames=num_frames,
+        )
         tokens = tokens.view(batch_size, num_frames, num_tokens, -1).clone()
         tokens[:, :, :patch_token_start] = tokens[:, :, :patch_token_start] + pose_delta.unsqueeze(2)
         return tokens.view(batch_size * num_frames, num_tokens, -1)
+
+    def condition_cached_output(
+        self,
+        cached_tokens: torch.Tensor,
+        *,
+        fixed_pose_enc: torch.Tensor | None,
+        fixed_pose_mask: torch.Tensor | None,
+        patch_token_start: int,
+    ) -> torch.Tensor:
+        if fixed_pose_enc is None:
+            return cached_tokens
+
+        batch_size, num_frames, _, _ = cached_tokens.shape
+        pose_delta = self._project_pose_delta(
+            fixed_pose_enc,
+            fixed_pose_mask,
+            pose_proj=self.cached_pose_proj,
+            tokens=cached_tokens,
+            batch_size=batch_size,
+            num_frames=num_frames,
+        )
+        cached_tokens = cached_tokens.clone()
+        cached_tokens[:, :, :patch_token_start] = cached_tokens[:, :, :patch_token_start] + pose_delta.unsqueeze(2)
+        return cached_tokens
+
+    def _project_pose_delta(
+        self,
+        fixed_pose_enc: torch.Tensor,
+        fixed_pose_mask: torch.Tensor | None,
+        *,
+        pose_proj: nn.Linear,
+        tokens: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+    ) -> torch.Tensor:
+        if fixed_pose_enc.shape[:2] != (batch_size, num_frames):
+            raise ValueError(
+                "fixed_pose_enc must have shape "
+                f"({batch_size}, {num_frames}, pose_dim), got {tuple(fixed_pose_enc.shape)}."
+            )
+        if fixed_pose_mask is None:
+            fixed_pose_mask = torch.ones(
+                batch_size,
+                num_frames,
+                dtype=torch.bool,
+                device=fixed_pose_enc.device,
+            )
+        if fixed_pose_mask.shape != (batch_size, num_frames):
+            raise ValueError(
+                "fixed_pose_mask must have shape "
+                f"({batch_size}, {num_frames}), got {tuple(fixed_pose_mask.shape)}."
+            )
+
+        fixed_pose_enc = fixed_pose_enc.to(device=tokens.device, dtype=torch.float32)
+        fixed_pose_mask = fixed_pose_mask.to(device=tokens.device, dtype=torch.bool)
+        pose_delta = pose_proj(self.pose_norm(fixed_pose_enc)).to(dtype=tokens.dtype)
+        return pose_delta * fixed_pose_mask.unsqueeze(-1).to(dtype=pose_delta.dtype)
 
 
 def init_slam_state() -> dict:
