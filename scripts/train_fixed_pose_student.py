@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ class CachedClip:
     path: str
     clip_length: int
     cache_dir: str
+    subclip_start: int = 0
+    cache_type: str = "clip"
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,7 @@ def prepare_global_window_teacher_cache(
     subclip_lengths: list[int] | None = None,
     subclip_stride: int = 1,
     canonicalize_subclips: bool = False,
+    cache_full_windows: bool = True,
     overwrite_cache: bool = False,
     cache_images: bool = False,
     cache_teacher_tokens: bool = True,
@@ -221,6 +225,8 @@ def prepare_global_window_teacher_cache(
     subclip_lengths = subclip_lengths or [5]
     if any(length < 2 or length > teacher_window_length for length in subclip_lengths):
         raise ValueError("Every subclip length must be in [2, teacher_window_length].")
+    if cache_full_windows and canonicalize_subclips:
+        raise ValueError("Full-window cache stores model-gauge teacher outputs and cannot canonicalize subclips.")
     max_exhaustive_stride = _max_exhaustive_teacher_window_stride(teacher_window_length, subclip_lengths)
     if teacher_window_stride is None:
         teacher_window_stride = max_exhaustive_stride
@@ -253,7 +259,8 @@ def prepare_global_window_teacher_cache(
         f"Preparing global-window teacher cache: sequences={len(frame_sequences)} windows={window_count} "
         f"teacher_window_length={teacher_window_length} teacher_window_stride={teacher_window_stride} "
         f"subclip_lengths={subclip_lengths} subclip_stride={subclip_stride} "
-        f"canonicalize_subclips={canonicalize_subclips} cache_teacher_tokens={cache_teacher_tokens} cache_dir={cache_root}"
+        f"canonicalize_subclips={canonicalize_subclips} cache_full_windows={cache_full_windows} "
+        f"cache_teacher_tokens={cache_teacher_tokens} cache_dir={cache_root}"
     )
 
     seen_subclips: set[tuple[str, int, int]] = set()
@@ -263,6 +270,66 @@ def prepare_global_window_teacher_cache(
             total_start = time.perf_counter()
             window_frames = sequence.frames[window_start : window_start + teacher_window_length]
             current_window_length = len(window_frames)
+            full_window_path = cache_root / sequence.name / f"window_{window_start:06d}.pt"
+
+            virtual_subclips = 0
+            for subclip_length in subclip_lengths:
+                for subclip_start in range(0, current_window_length - subclip_length + 1, subclip_stride):
+                    global_start = window_start + subclip_start
+                    subclip_key = (sequence.name, subclip_length, global_start)
+                    if subclip_key in seen_subclips:
+                        continue
+                    seen_subclips.add(subclip_key)
+                    if cache_full_windows:
+                        output_path = full_window_path
+                        cache_type = "global_window_full"
+                    else:
+                        output_path = (
+                            cache_root
+                            / sequence.name
+                            / f"window_{window_start:06d}"
+                            / f"clip_L{subclip_length:03d}_{global_start:06d}.pt"
+                        )
+                        cache_type = "global_window_subclip"
+                    clips.append(
+                        CachedClip(
+                            sequence.name,
+                            global_start,
+                            str(output_path),
+                            subclip_length,
+                            str(cache_root),
+                            subclip_start=subclip_start,
+                            cache_type=cache_type,
+                        )
+                    )
+                    virtual_subclips += 1
+
+            if cache_full_windows and full_window_path.exists() and not overwrite_cache:
+                load_s = 0.0
+                teacher_s = 0.0
+                save_s = 0.0
+                total_s = time.perf_counter() - total_start
+                window_profiles.append(
+                    {
+                        "window_index": window_index,
+                        "sequence": sequence.name,
+                        "window_start": window_start,
+                        "window_length": current_window_length,
+                        "num_subclips": virtual_subclips,
+                        "load_s": load_s,
+                        "teacher_s": teacher_s,
+                        "save_s": save_s,
+                        "total_s": total_s,
+                        "cache_hit": True,
+                    }
+                )
+                window_index += 1
+                if window_index == 1 or window_index % max(log_every, 1) == 0 or window_index == window_count:
+                    print(
+                        f"window={window_index:04d}/{window_count} seq={sequence.name} start={window_start} "
+                        f"subclips={virtual_subclips} cache_hit=True total={total_s:.3f}s"
+                    )
+                continue
 
             load_start = time.perf_counter()
             window_images = load_and_preprocess_images(window_frames, image_resolution=image_resolution).to(device, non_blocking=True)
@@ -289,25 +356,36 @@ def prepare_global_window_teacher_cache(
 
             save_start = time.perf_counter()
             saved_subclips = 0
-            for subclip_length in subclip_lengths:
-                for subclip_start in range(0, current_window_length - subclip_length + 1, subclip_stride):
-                    global_start = window_start + subclip_start
-                    output_path = (
-                        cache_root
-                        / sequence.name
-                        / f"window_{window_start:06d}"
-                        / f"clip_L{subclip_length:03d}_{global_start:06d}.pt"
+            if cache_full_windows:
+                full_window_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "cache_type": "global_window_full",
+                    "sequence": sequence.name,
+                    "start": window_start,
+                    "window_start": window_start,
+                    "window_length": current_window_length,
+                    "frame_paths": window_frames,
+                    "image_resolution": image_resolution,
+                    "coordinate_frame": "full_vggt_teacher_window",
+                    "canonicalized_to_first_frame": False,
+                    "teacher_pose": teacher_pose_global.detach().cpu().to(torch.float32),
+                }
+                if cache_images:
+                    payload["images"] = window_images.detach().cpu().to(torch.float16)
+                if cache_teacher_tokens:
+                    payload["teacher_camera_and_register_tokens"] = (
+                        teacher_predictions["camera_and_register_tokens"].detach().cpu().to(torch.float16)
                     )
-                    subclip_key = (sequence.name, subclip_length, global_start)
-                    if subclip_key in seen_subclips:
-                        continue
-                    seen_subclips.add(subclip_key)
-                    clips.append(CachedClip(sequence.name, global_start, str(output_path), subclip_length, str(cache_root)))
+                torch.save(payload, full_window_path)
+                saved_subclips = virtual_subclips
+            else:
+                for clip in clips[-virtual_subclips:]:
+                    output_path = Path(clip.path)
                     if output_path.exists() and not overwrite_cache:
                         saved_subclips += 1
                         continue
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    clip_slice = slice(subclip_start, subclip_start + subclip_length)
+                    clip_slice = slice(clip.subclip_start, clip.subclip_start + clip.clip_length)
                     if canonicalize_subclips:
                         subclip_extrinsic = _canonicalize_extrinsics_to_first_camera(
                             teacher_extrinsic[:, clip_slice]
@@ -323,13 +401,13 @@ def prepare_global_window_teacher_cache(
                         coordinate_frame = "full_vggt_teacher_window"
                     payload = {
                         "sequence": sequence.name,
-                        "start": global_start,
+                        "start": clip.start,
                         "window_start": window_start,
                         "window_length": current_window_length,
-                        "subclip_start": subclip_start,
+                        "subclip_start": clip.subclip_start,
                         "frame_paths": window_frames[clip_slice],
                         "image_resolution": image_resolution,
-                        "clip_length": subclip_length,
+                        "clip_length": clip.clip_length,
                         "coordinate_frame": coordinate_frame,
                         "canonicalized_to_first_frame": canonicalize_subclips,
                         "teacher_pose": subclip_pose.detach().cpu().to(torch.float32),
@@ -366,8 +444,8 @@ def prepare_global_window_teacher_cache(
                 )
 
     manifest = {
-        "version": 2,
-        "cache_type": "global_window_subclips",
+        "version": 3 if cache_full_windows else 2,
+        "cache_type": "global_window_full" if cache_full_windows else "global_window_subclips",
         "teacher_checkpoint": teacher_checkpoint,
         "image_resolution": image_resolution,
         "teacher_window_length": teacher_window_length,
@@ -375,6 +453,7 @@ def prepare_global_window_teacher_cache(
         "subclip_lengths": subclip_lengths,
         "subclip_stride": subclip_stride,
         "canonicalize_subclips": canonicalize_subclips,
+        "cache_full_windows": cache_full_windows,
         "cache_images": cache_images,
         "cache_teacher_tokens": cache_teacher_tokens,
         "sequences": [{"name": seq.name, "num_frames": len(seq.frames)} for seq in frame_sequences],
@@ -385,6 +464,8 @@ def prepare_global_window_teacher_cache(
                 "path": clip.path,
                 "clip_length": clip.clip_length,
                 "cache_dir": clip.cache_dir,
+                "subclip_start": clip.subclip_start,
+                "cache_type": clip.cache_type,
             }
             for clip in clips
         ],
@@ -393,6 +474,219 @@ def prepare_global_window_teacher_cache(
     (cache_root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Saved global-window teacher cache manifest: {cache_root / MANIFEST_NAME}")
     return clips
+
+
+def convert_subclip_cache_to_full_window_cache(
+    *,
+    source_cache_dir: str,
+    output_cache_dir: str,
+    subclip_lengths: list[int] | None = None,
+    subclip_stride: int = 1,
+    overwrite_cache: bool = False,
+    log_every: int = 1,
+) -> list[CachedClip]:
+    subclip_lengths = subclip_lengths or [2, 3, 4, 5]
+    if any(length < 2 for length in subclip_lengths):
+        raise ValueError("Every virtual subclip length must be at least 2.")
+    if subclip_stride < 1:
+        raise ValueError("subclip_stride must be at least 1.")
+
+    source_root = Path(source_cache_dir)
+    source_manifest_path = source_root / MANIFEST_NAME
+    if not source_manifest_path.exists():
+        raise FileNotFoundError(f"Source teacher cache manifest not found: {source_manifest_path}")
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    if source_manifest.get("cache_type") != "global_window_subclips":
+        raise ValueError("Source cache must be a global_window_subclips cache.")
+    if source_manifest.get("canonicalize_subclips"):
+        raise ValueError("Cannot build model-gauge full-window cache from canonicalized subclips.")
+    if not source_manifest.get("cache_teacher_tokens"):
+        raise ValueError("Source cache must contain teacher camera/register tokens.")
+
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for item in source_manifest.get("clips", []):
+        path = Path(item["path"])
+        if not path.exists():
+            continue
+        window_start = int(item.get("window_start", _parse_window_start_from_cache_path(path)))
+        grouped.setdefault((str(item["sequence"]), window_start), []).append(item)
+    if not grouped:
+        raise ValueError(f"No existing source cache clips found in {source_cache_dir}.")
+
+    output_root = Path(output_cache_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    clips: list[CachedClip] = []
+    profiles: list[dict[str, Any]] = []
+    seen_subclips: set[tuple[str, int, int]] = set()
+    window_items = sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))
+    print(
+        f"Converting subclip cache to full-window cache: source={source_root} output={output_root} "
+        f"windows={len(window_items)} virtual_subclip_lengths={subclip_lengths}"
+    )
+
+    for window_index, ((sequence_name, window_start), source_items) in enumerate(window_items):
+        total_start = time.perf_counter()
+        source_items = sorted(source_items, key=lambda item: int(item.get("subclip_start", int(item["start"]) - window_start)))
+
+        sample_payload = torch.load(source_items[0]["path"], map_location="cpu", weights_only=False)
+        window_length = int(sample_payload.get("window_length", max(int(item["start"]) - window_start + int(item["clip_length"]) for item in source_items)))
+        image_resolution = int(sample_payload.get("image_resolution", source_manifest.get("image_resolution", 512)))
+        pose_dim = int(sample_payload["teacher_pose"].shape[-1])
+        token_shape = tuple(sample_payload["teacher_camera_and_register_tokens"].shape[2:])
+        teacher_pose = torch.empty((1, window_length, pose_dim), dtype=torch.float32)
+        teacher_tokens = torch.empty((1, window_length, *token_shape), dtype=torch.float16)
+        frame_paths: list[str | None] = [None] * window_length
+        filled = torch.zeros(window_length, dtype=torch.bool)
+
+        for item in source_items:
+            payload = torch.load(item["path"], map_location="cpu", weights_only=False)
+            clip_length = int(payload.get("clip_length", item["clip_length"]))
+            subclip_start = int(payload.get("subclip_start", int(item["start"]) - window_start))
+            clip_slice = slice(subclip_start, subclip_start + clip_length)
+            teacher_pose[:, clip_slice] = payload["teacher_pose"].to(torch.float32)
+            teacher_tokens[:, clip_slice] = payload["teacher_camera_and_register_tokens"].to(torch.float16)
+            for offset, frame_path in enumerate(payload.get("frame_paths", [])):
+                if subclip_start + offset < len(frame_paths):
+                    frame_paths[subclip_start + offset] = frame_path
+            filled[clip_slice] = True
+
+        covered_ranges: list[tuple[int, int]] = []
+        pos = 0
+        while pos < window_length:
+            while pos < window_length and not bool(filled[pos]):
+                pos += 1
+            if pos >= window_length:
+                break
+            range_start = pos
+            while pos < window_length and bool(filled[pos]):
+                pos += 1
+            covered_ranges.append((range_start, pos))
+
+        virtual_subclips = 0
+        saved_ranges = 0
+        save_s = 0.0
+        for range_start, range_end in covered_ranges:
+            range_length = range_end - range_start
+            if range_length < min(subclip_lengths):
+                continue
+            range_paths = frame_paths[range_start:range_end]
+            missing_paths = [idx for idx, path in enumerate(range_paths, start=range_start) if not isinstance(path, str) or not path]
+            if missing_paths:
+                raise ValueError(
+                    f"Source cache is missing frame paths sequence={sequence_name} "
+                    f"window_start={window_start}; missing positions={missing_paths[:10]}"
+                )
+            if range_start == 0 and range_end == window_length:
+                output_path = output_root / sequence_name / f"window_{window_start:06d}.pt"
+            else:
+                output_path = output_root / sequence_name / f"window_{window_start:06d}_range_{range_start:03d}.pt"
+
+            range_virtual_subclips = 0
+            for subclip_length in subclip_lengths:
+                for local_start in range(0, range_length - subclip_length + 1, subclip_stride):
+                    global_start = window_start + range_start + local_start
+                    subclip_key = (sequence_name, subclip_length, global_start)
+                    if subclip_key in seen_subclips:
+                        continue
+                    seen_subclips.add(subclip_key)
+                    clips.append(
+                        CachedClip(
+                            sequence_name,
+                            global_start,
+                            str(output_path),
+                            subclip_length,
+                            str(output_root),
+                            subclip_start=local_start,
+                            cache_type="global_window_full",
+                        )
+                    )
+                    range_virtual_subclips += 1
+
+            if range_virtual_subclips == 0:
+                continue
+            save_start = time.perf_counter()
+            if overwrite_cache or not output_path.exists():
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "cache_type": "global_window_full",
+                    "sequence": sequence_name,
+                    "start": window_start + range_start,
+                    "window_start": window_start + range_start,
+                    "source_window_start": window_start,
+                    "source_range_start": range_start,
+                    "window_length": range_length,
+                    "frame_paths": [str(path) for path in range_paths],
+                    "image_resolution": image_resolution,
+                    "coordinate_frame": "full_vggt_teacher_window",
+                    "canonicalized_to_first_frame": False,
+                    "teacher_pose": teacher_pose[:, range_start:range_end].contiguous(),
+                    "teacher_camera_and_register_tokens": teacher_tokens[:, range_start:range_end].contiguous(),
+                }
+                torch.save(payload, output_path)
+            save_s += time.perf_counter() - save_start
+            virtual_subclips += range_virtual_subclips
+            saved_ranges += 1
+        total_s = time.perf_counter() - total_start
+        profiles.append(
+            {
+                "window_index": window_index,
+                "sequence": sequence_name,
+                "window_start": window_start,
+                "window_length": window_length,
+                "covered_ranges": [[start, end] for start, end in covered_ranges],
+                "saved_ranges": saved_ranges,
+                "num_source_subclips": len(source_items),
+                "num_virtual_subclips": virtual_subclips,
+                "save_s": save_s,
+                "total_s": total_s,
+            }
+        )
+        if window_index == 0 or (window_index + 1) % max(log_every, 1) == 0 or window_index + 1 == len(window_items):
+            print(
+                f"convert_window={window_index + 1:04d}/{len(window_items)} seq={sequence_name} "
+                f"start={window_start} source_subclips={len(source_items)} "
+                f"ranges={len(covered_ranges)} saved_ranges={saved_ranges} "
+                f"virtual_subclips={virtual_subclips} save={save_s:.3f}s total={total_s:.3f}s"
+            )
+
+    manifest = {
+        "version": 3,
+        "cache_type": "global_window_full",
+        "source_cache_dir": source_cache_dir,
+        "image_resolution": source_manifest.get("image_resolution", 512),
+        "teacher_window_length": source_manifest.get("teacher_window_length"),
+        "teacher_window_stride": source_manifest.get("teacher_window_stride"),
+        "subclip_lengths": subclip_lengths,
+        "subclip_stride": subclip_stride,
+        "canonicalize_subclips": False,
+        "cache_full_windows": True,
+        "cache_images": False,
+        "cache_teacher_tokens": True,
+        "sequences": source_manifest.get("sequences", []),
+        "clips": [
+            {
+                "sequence": clip.sequence,
+                "start": clip.start,
+                "path": clip.path,
+                "clip_length": clip.clip_length,
+                "cache_dir": clip.cache_dir,
+                "subclip_start": clip.subclip_start,
+                "cache_type": clip.cache_type,
+            }
+            for clip in clips
+        ],
+        "conversion_profile": profiles,
+    }
+    (output_root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Saved full-window teacher cache manifest: {output_root / MANIFEST_NAME}")
+    return clips
+
+
+def _parse_window_start_from_cache_path(path: Path) -> int:
+    for part in path.parts:
+        if part.startswith("window_"):
+            return int(part.removeprefix("window_"))
+    raise ValueError(f"Cannot parse window_start from cache path: {path}")
 
 
 def train_fixed_pose_student(
@@ -1093,13 +1387,24 @@ def _load_cached_clips(cache_dirs: list[str]) -> list[CachedClip]:
             continue
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest_clip_length = int(manifest.get("clip_length", 0))
+        manifest_cache_type = str(manifest.get("cache_type", "clip"))
         for item in manifest.get("clips", []):
             path = item["path"]
             clip_length = int(item.get("clip_length", manifest_clip_length))
             if clip_length <= 0:
                 raise ValueError(f"Cached clip is missing clip_length metadata: {path}")
             if Path(path).exists():
-                clips.append(CachedClip(item["sequence"], int(item["start"]), path, clip_length, cache_dir))
+                clips.append(
+                    CachedClip(
+                        item["sequence"],
+                        int(item["start"]),
+                        path,
+                        clip_length,
+                        cache_dir,
+                        subclip_start=int(item.get("subclip_start", 0)),
+                        cache_type=str(item.get("cache_type", manifest_cache_type)),
+                    )
+                )
     return clips
 
 
@@ -1112,21 +1417,38 @@ def _load_cached_payload(
     teacher_pose = payload["teacher_pose"]
     teacher_tokens = payload.get("teacher_camera_and_register_tokens")
     clip_length = int(payload.get("clip_length", clip.clip_length))
+    if clip.cache_type == "global_window_full" or payload.get("cache_type") == "global_window_full":
+        window_length = int(payload.get("window_length", teacher_pose.shape[1]))
+        clip_length = clip.clip_length
+        clip_slice = slice(clip.subclip_start, clip.subclip_start + clip_length)
+        if clip_slice.stop > window_length:
+            raise ValueError(f"Cached virtual clip extends beyond window: {clip.path}")
+        images = images[clip_slice] if images is not None else None
+        frame_paths = frame_paths[clip_slice]
+        teacher_pose = teacher_pose[:, clip_slice]
+        teacher_tokens = teacher_tokens[:, clip_slice] if teacher_tokens is not None else None
     if images is not None and images.shape[0] != clip_length:
         raise ValueError(f"Cached image clip has unexpected length: {clip.path}")
+    if len(frame_paths) != clip_length:
+        raise ValueError(f"Cached frame_paths has unexpected length: {clip.path}")
+    bad_frame_paths = [idx for idx, frame_path in enumerate(frame_paths) if not isinstance(frame_path, str) or not frame_path]
+    if bad_frame_paths:
+        raise ValueError(f"Cached frame_paths contains empty paths at positions {bad_frame_paths[:10]}: {clip.path}")
     if teacher_pose.shape[1] != clip_length:
         raise ValueError(f"Cached teacher pose has unexpected length: {clip.path}")
+    if not bool(torch.isfinite(teacher_pose).all()):
+        raise ValueError(f"Cached teacher pose contains non-finite values: {clip.path}")
     if teacher_tokens is not None and teacher_tokens.shape[1] != clip_length:
         raise ValueError(f"Cached teacher tokens have unexpected length: {clip.path}")
-    if frame_paths and len(frame_paths) != clip_length:
-        raise ValueError(f"Cached frame_paths has unexpected length: {clip.path}")
+    if teacher_tokens is not None and not bool(torch.isfinite(teacher_tokens).all()):
+        raise ValueError(f"Cached teacher tokens contain non-finite values: {clip.path}")
     return (
         images,
         frame_paths,
         teacher_pose,
         teacher_tokens,
         str(payload.get("sequence", clip.sequence)),
-        int(payload.get("start", clip.start)),
+        clip.start if clip.cache_type == "global_window_full" else int(payload.get("start", clip.start)),
         clip_length,
     )
 
@@ -1243,7 +1565,7 @@ def _load_frame_sequences(inputs: list[str]) -> list[FrameSequence]:
             frames = _list_images(path)
             name = path.name
         else:
-            matches = sorted(glob.glob(item))
+            matches = _natural_sorted_paths(glob.glob(item))
             frames = [match for match in matches if _is_image(match)]
             if glob.has_magic(item):
                 name = Path(os.path.commonpath(matches)).name if matches else item
@@ -1293,7 +1615,7 @@ def _unique_sequence_names_for_items(items: list[str]) -> dict[str, str]:
 def _sequence_name_path(item: str) -> Path:
     path = Path(item)
     if glob.has_magic(item):
-        matches = sorted(glob.glob(item))
+        matches = _natural_sorted_paths(glob.glob(item))
         if matches:
             path = Path(os.path.commonpath(matches))
     return path
@@ -1308,9 +1630,25 @@ def _sanitize_sequence_name(name: str) -> str:
 def _list_images(directory: Path) -> list[str]:
     return [
         str(path)
-        for path in sorted(directory.iterdir())
+        for path in _natural_sorted_paths(directory.iterdir())
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     ]
+
+
+def _natural_sorted_paths(paths):
+    return sorted(paths, key=_natural_path_sort_key)
+
+
+def _natural_path_sort_key(path: str | Path) -> tuple[tuple[tuple[int, int | str], ...], ...]:
+    return tuple(_natural_string_sort_key(part) for part in Path(path).parts)
+
+
+def _natural_string_sort_key(text: str) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (0, int(token)) if token.isdigit() else (1, token.lower())
+        for token in re.split(r"(\d+)", text)
+        if token
+    )
 
 
 def _is_image(path: str) -> bool:
@@ -1535,6 +1873,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prepare-teacher-cache", action="store_true")
     parser.add_argument("--prepare-global-window-cache", action="store_true")
+    parser.add_argument("--convert-subclip-cache-to-full-window-cache", action="store_true")
+    parser.add_argument("--source-teacher-cache-dir")
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--image-resolution", type=int, default=512)
@@ -1566,6 +1906,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subclip-lengths", type=int, nargs="+", default=[5])
     parser.add_argument("--subclip-stride", type=int, default=1)
     parser.add_argument("--canonicalize-subclips", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cache-full-windows", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cache-images", action="store_true")
     parser.add_argument("--cache-teacher-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -1608,8 +1949,13 @@ def main() -> None:
     args = parser.parse_args()
 
     sequences = _load_frame_sequences(args.frame_sequences)
-    if args.prepare_teacher_cache and args.prepare_global_window_cache:
-        raise ValueError("Choose only one cache preparation mode.")
+    cache_modes = [
+        args.prepare_teacher_cache,
+        args.prepare_global_window_cache,
+        args.convert_subclip_cache_to_full_window_cache,
+    ]
+    if sum(bool(mode) for mode in cache_modes) > 1:
+        raise ValueError("Choose only one cache preparation/conversion mode.")
 
     if args.prepare_teacher_cache:
         if not args.teacher_cache_dir:
@@ -1646,10 +1992,29 @@ def main() -> None:
             subclip_lengths=args.subclip_lengths,
             subclip_stride=args.subclip_stride,
             canonicalize_subclips=args.canonicalize_subclips,
+            cache_full_windows=args.cache_full_windows,
             overwrite_cache=args.overwrite_cache,
             cache_images=args.cache_images,
             cache_teacher_tokens=args.cache_teacher_tokens,
             device=args.device,
+            log_every=args.log_every,
+        )
+        if args.cache_only:
+            return
+
+    if args.convert_subclip_cache_to_full_window_cache:
+        if not args.source_teacher_cache_dir:
+            raise ValueError("--source-teacher-cache-dir is required with --convert-subclip-cache-to-full-window-cache")
+        if not args.teacher_cache_dir:
+            raise ValueError("--teacher-cache-dir is required with --convert-subclip-cache-to-full-window-cache")
+        if len(args.teacher_cache_dir) != 1:
+            raise ValueError("Pass exactly one --teacher-cache-dir when converting a cache.")
+        convert_subclip_cache_to_full_window_cache(
+            source_cache_dir=args.source_teacher_cache_dir,
+            output_cache_dir=args.teacher_cache_dir[0],
+            subclip_lengths=args.subclip_lengths,
+            subclip_stride=args.subclip_stride,
+            overwrite_cache=args.overwrite_cache,
             log_every=args.log_every,
         )
         if args.cache_only:

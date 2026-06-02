@@ -7,9 +7,12 @@ STUDENT_INIT_CHECKPOINT="${STUDENT_INIT_CHECKPOINT:-}"
 OUTPUT_CHECKPOINT="${OUTPUT_CHECKPOINT:-/tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_tum_eth_mit_curriculum_epoch1.pt}"
 PROFILE_OUTPUT="${PROFILE_OUTPUT:-/tmp/vggt_fixed_pose_ft/profile_tum_eth_mit_curriculum_epoch1.json}"
 
-TUM_CACHE="${TUM_CACHE:-/app/outputs/teacher_cache/cache_public_rgb_w100_sub2_3_4_5_tokens}"
-ETH_CACHE="${ETH_CACHE:-/app/outputs/teacher_cache/cache_eth_cam0_w100_sub2_3_4_5_tokens}"
-MIT_CACHE="${MIT_CACHE:-/app/outputs/teacher_cache/cache_mit_jpg_w100_sub2_3_4_5_tokens}"
+TUM_CACHE="${TUM_CACHE:-/app/outputs/teacher_cache/cache_public_rgb_w100_windows_sub2_3_4_5_tokens}"
+ETH_CACHE="${ETH_CACHE:-/app/outputs/teacher_cache/cache_eth_cam0_w100_windows_sub2_3_4_5_tokens}"
+MIT_CACHE="${MIT_CACHE:-/app/outputs/teacher_cache/cache_mit_jpg_w100_windows_sub2_3_4_5_tokens}"
+TUM_SOURCE_CACHE="${TUM_SOURCE_CACHE:-/app/outputs/teacher_cache/cache_public_rgb_w100_sub5_tokens}"
+ETH_SOURCE_CACHE="${ETH_SOURCE_CACHE:-/app/outputs/teacher_cache/cache_eth_cam0_w100_sub5_tokens}"
+MIT_SOURCE_CACHE="${MIT_SOURCE_CACHE:-/app/outputs/teacher_cache/cache_mit_jpg_w100_sub5_tokens}"
 
 IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-512}"
 TEACHER_WINDOW_LENGTH="${TEACHER_WINDOW_LENGTH:-100}"
@@ -53,39 +56,37 @@ MIT_JPG_DIRS=(
 echo "Using config record: ${CONFIG_JSON}"
 echo "Curriculum subclip lengths: ${SUBCLIP_LENGTHS[*]}"
 echo "Training curriculum clip lengths: ${CURRICULUM_CLIP_LENGTHS[*]}"
-echo "Preparing TUM RGB-D teacher-token cache at ${TUM_CACHE}"
+echo "Converting TUM RGB-D teacher-token cache from ${TUM_SOURCE_CACHE} to ${TUM_CACHE}"
 python scripts/train_fixed_pose_student.py \
   "${TUM_RGBD_DIRS[@]}" \
   --teacher-checkpoint "${TEACHER_CHECKPOINT}" \
   --output /tmp/vggt_fixed_pose_ft/checkpoints/tum_cache_prepare_dummy.pt \
   --teacher-cache-dir "${TUM_CACHE}" \
-  --prepare-global-window-cache \
+  --source-teacher-cache-dir "${TUM_SOURCE_CACHE}" \
+  --convert-subclip-cache-to-full-window-cache \
   --cache-only \
   --image-resolution "${IMAGE_RESOLUTION}" \
-  --teacher-window-length "${TEACHER_WINDOW_LENGTH}" \
   --subclip-lengths "${SUBCLIP_LENGTHS[@]}" \
   --subclip-stride 1 \
-  --cache-teacher-tokens \
-  --device "${DEVICE}" \
+  --overwrite-cache \
   --log-every 1
 
-echo "Preparing ETH cam0 teacher-token cache at ${ETH_CACHE}"
+echo "Converting ETH cam0 teacher-token cache from ${ETH_SOURCE_CACHE} to ${ETH_CACHE}"
 python scripts/train_fixed_pose_student.py \
   "${ETH_CAM0_DIRS[@]}" \
   --teacher-checkpoint "${TEACHER_CHECKPOINT}" \
   --output /tmp/vggt_fixed_pose_ft/checkpoints/eth_cache_prepare_dummy.pt \
   --teacher-cache-dir "${ETH_CACHE}" \
-  --prepare-global-window-cache \
+  --source-teacher-cache-dir "${ETH_SOURCE_CACHE}" \
+  --convert-subclip-cache-to-full-window-cache \
   --cache-only \
   --image-resolution "${IMAGE_RESOLUTION}" \
-  --teacher-window-length "${TEACHER_WINDOW_LENGTH}" \
   --subclip-lengths "${SUBCLIP_LENGTHS[@]}" \
   --subclip-stride 1 \
-  --cache-teacher-tokens \
-  --device "${DEVICE}" \
+  --overwrite-cache \
   --log-every 1
 
-echo "Preparing MIT JPEG teacher-token cache at ${MIT_CACHE}"
+echo "Preparing MIT JPEG teacher-token cache from naturally sorted raw frames at ${MIT_CACHE}"
 python scripts/train_fixed_pose_student.py \
   "${MIT_JPG_DIRS[@]}" \
   --teacher-checkpoint "${TEACHER_CHECKPOINT}" \
@@ -99,6 +100,7 @@ python scripts/train_fixed_pose_student.py \
   --subclip-stride 1 \
   --cache-teacher-tokens \
   --device "${DEVICE}" \
+  --overwrite-cache \
   --log-every 1
 
 train_args=(

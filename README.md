@@ -243,115 +243,135 @@ The `.npz` file contains:
 ## Fine-Tuning Fixed-Pose KV SLAM
 
 `scripts/train_fixed_pose_student.py` is the repeatable fine-tuning entry point
-for the fixed-pose path. The preferred cache now uses long full-teacher windows:
-run full VGGT-Omega once on a 100-frame sequence window, then cut many smaller
-training subclips from that same teacher coordinate frame.
-
-This matters because a small subclip should not get its own first-frame-origin
-VGGT coordinate system. For a 100-frame teacher window, subclips such as
-`0..9`, `1..10`, and `2..11` all reuse the 100-frame teacher poses, so the first
-frame of a subclip is often not at the origin. The model therefore learns that
-`fixed_pose_enc` is an input SLAM/global pose, not merely VGGT's default local
-pose convention.
-
-Each cached subclip uses the last frame as the target and all earlier frames as
-fixed-pose history:
+for the fixed-pose path. The current preferred recipe is **curriculum
+distillation from full-window teacher cache**:
 
 ```text
-full teacher window  -> e.g. frames 0..99, 100..199, 200..299
-subclip length N     -> frames i..i+N-2 are fixed_pose_enc + fixed_pose_mask=True
-frame i+N-1          -> left unlocked; predicted pose is compared with teacher pose
-cached target pose   -> full-window teacher coordinate frame, not subclip-local
+100-frame teacher window -> reusable teacher_pose + teacher_camera_and_register_tokens
+2-frame virtual clip     -> 1 fixed history frame + 1 supervised target
+3-frame virtual clip     -> 2 fixed history frames + 1 supervised target
+4-frame virtual clip     -> 3 fixed history frames + 1 supervised target
+5-frame virtual clip     -> 4 fixed history frames + 1 supervised target
 ```
+
+Small training clips should not get their own first-frame-origin VGGT coordinate
+system. Subclips cut from a 100-frame teacher window reuse that full-window
+teacher coordinate frame, so the first frame of a subclip is often not canonical.
+The model therefore learns that `fixed_pose_enc` is an input model-gauge SLAM
+anchor, not merely VGGT's default first-frame local convention.
 
 When `--freeze-backbone` is enabled, the frozen VGGT-Omega backbone stays in
 `eval()` mode and only `aggregator.fixed_pose_conditioner` is in `train()` mode.
-That keeps training mode aligned with inference and avoids updating the original
-checkpoint.
+Training supervises `pose_enc_model` on fixed history frames before pass-through
+replacement, so the camera head learns the locked poses instead of only the
+public `pose_enc` API being overwritten. Token distillation also supervises final
+camera/register tokens when the cache contains
+`teacher_camera_and_register_tokens`.
 
-Extract 2 FPS training frames once, then keep both the frames and teacher cache
-under `outputs/teacher_cache/` so later fine-tuning runs can reuse them without
-rerunning the teacher. Inside docker compose these paths are visible under
-`/app/outputs/teacher_cache/`:
+The public-data curriculum recipe uses TUM RGB-D, EuRoC/ETH cam0, and MIT JPEG
+frame directories under `/app/public_data`, then trains sequential stages
+`1+1 -> 2+1 -> 3+1 -> 4+1`. `scripts/train_fixed_pose_public_only.sh` records the
+same paths and defaults:
 
-```bash
-mkdir -p outputs/teacher_cache/frames_exhaustive5/DJI_0005 outputs/teacher_cache/frames_exhaustive5/DJI_0010
-ffmpeg -y -i /home/ubuntu/3d/DJI_0005.MP4 -vf fps=2 outputs/teacher_cache/frames_exhaustive5/DJI_0005/frame_%06d.jpeg
-ffmpeg -y -i /home/ubuntu/3d/DJI_0010.MP4 -vf fps=2 outputs/teacher_cache/frames_exhaustive5/DJI_0010/frame_%06d.jpeg
+```text
+SUBCLIP_LENGTHS=2 3 4 5
+CURRICULUM_CLIP_LENGTHS=2 3 4 5
+BATCH_SIZE=3
+LR=8e-6
+TOKEN_WEIGHT=0.1
+WANDB=1
 ```
 
-Prepare a global-window teacher cache. The default fine-tuning path now uses
-exhaustive sliding 5-frame subclips: `0..4`, `1..5`, `2..6`, and so on. The
-first 4 frames are fixed history and the 5th frame is the supervised target.
-By default, subclips stay in the full 100-frame teacher coordinate frame
-(`--canonicalize-subclips` is off), which keeps README/training aligned with
-the fixed-pose SLAM convention. `--subclip-stride` defaults to `1`;
-`--teacher-window-stride` defaults to the largest stride that still covers
-cross-window boundary clips, so a 100-frame teacher window with 5-frame
-subclips uses stride `96` plus a final tail window. The cache stores
-`frame_paths + teacher_pose + teacher_camera_and_register_tokens` rather than
-repeating image tensors for every subclip. The teacher tokens are stored in
-float16 and let fine-tuning supervise the model's internal representation, not
-only the public pose output:
+Set environment variables to override the defaults, for example:
+
+```bash
+WANDB=0 LR=3e-6 EPOCHS=1 \
+docker compose run --rm vggt-omega \
+  bash scripts/train_fixed_pose_public_only.sh
+```
+
+The curriculum cache paths used by the script are:
+
+```text
+/app/outputs/teacher_cache/cache_public_rgb_w100_windows_sub2_3_4_5_tokens
+/app/outputs/teacher_cache/cache_eth_cam0_w100_windows_sub2_3_4_5_tokens
+/app/outputs/teacher_cache/cache_mit_jpg_w100_windows_sub2_3_4_5_tokens
+```
+
+If those full-window caches do not exist yet, they can be prepared directly from
+frame directories or converted from existing 5-frame teacher-token caches:
+
+```text
+/app/outputs/teacher_cache/cache_public_rgb_w100_sub5_tokens
+/app/outputs/teacher_cache/cache_eth_cam0_w100_sub5_tokens
+/app/outputs/teacher_cache/cache_mit_jpg_w100_sub5_tokens
+```
+
+To prepare a full-window cache directly from frame directories instead of
+converting an existing cache, run `--prepare-global-window-cache` with
+`--cache-full-windows` and the curriculum subclip lengths:
 
 ```bash
 docker compose run --rm vggt-omega \
   python scripts/train_fixed_pose_student.py \
-    /app/outputs/teacher_cache/frames_exhaustive5/DJI_0005 \
-    /app/outputs/teacher_cache/frames_exhaustive5/DJI_0010 \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_360/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam2/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam3/rgb \
     --teacher-checkpoint /app/checkpoints/VGGT-Omega-1B-512/model.pt \
-    --output /tmp/vggt_fixed_pose_ft/checkpoints/global_window_cache_dummy.pt \
-    --teacher-cache-dir /app/outputs/teacher_cache/cache_global_w100_sub5_exhaustive \
+    --output /tmp/vggt_fixed_pose_ft/checkpoints/cache_prepare_dummy.pt \
+    --teacher-cache-dir /app/outputs/teacher_cache/cache_public_rgb_w100_windows_sub2_3_4_5_tokens \
     --prepare-global-window-cache \
     --cache-only \
     --image-resolution 512 \
     --teacher-window-length 100 \
-    --subclip-lengths 5 \
-    --subclip-stride 1
+    --subclip-lengths 2 3 4 5 \
+    --subclip-stride 1 \
+    --cache-full-windows \
+    --cache-teacher-tokens
 ```
 
-The generated cache is reusable. It stores teacher pose labels, final
-camera/register token labels, and frame paths; keep
-`outputs/teacher_cache/frames_exhaustive5` alongside the cache so future
-training can skip the teacher pass and run with `teacher_s=0`. Pass
-`--no-cache-teacher-tokens` only for a smaller pose-only cache.
-
-Train one epoch over the global-window cache. When `--fixed-frames` is omitted,
-each 5-frame subclip automatically fixes the first 4 history frames and
-supervises the final frame. The pose objective is split into translation,
-quaternion geodesic rotation, and FoV terms; all three weights default to `1.0`
-and can be tuned with `--translation-weight`, `--rotation-weight`, and
-`--fov-weight`. Training also supervises `pose_enc_model` on the fixed history
-frames before pass-through replacement, controlled by `--fixed-raw-pose-weight`,
-so the camera head learns the locked poses instead of only the public
-`pose_enc` API being overwritten. When the cache contains
-`teacher_camera_and_register_tokens`, training also adds a final-token
-distillation loss controlled by `--token-weight` (default `0.1`),
-`--fixed-token-weight`, and `--target-token-weight`. This is the stronger
-objective intended to make the model's internal tokens use the fixed poses.
-`--batch-size` is implemented as gradient accumulation because the first
-fixed-pose SLAM state is batch-size 1 internally:
+Manual training over prepared curriculum caches looks like:
 
 ```bash
 docker compose run --rm vggt-omega \
   python scripts/train_fixed_pose_student.py \
-    /app/outputs/teacher_cache/frames_exhaustive5/DJI_0005 \
-    /app/outputs/teacher_cache/frames_exhaustive5/DJI_0010 \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_360/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam2/rgb \
+    /app/public_data/tum/rgbd_dataset_freiburg2_pioneer_slam3/rgb \
+    /app/public_data/eth/machine_hall/MH_01_easy/mav0/cam0/data \
+    /app/public_data/eth/machine_hall/MH_02_easy/mav0/cam0/data \
+    /app/public_data/eth/machine_hall/MH_03_medium/mav0/cam0/data \
+    /app/public_data/eth/machine_hall/MH_04_difficult/mav0/cam0/data \
+    /app/public_data/eth/machine_hall/MH_05_difficult/mav0/cam0/data \
+    /app/public_data/mit/office \
+    /app/public_data/mit/apartment/images \
+    /app/public_data/mit/building/images \
     --teacher-checkpoint /app/checkpoints/VGGT-Omega-1B-512/model.pt \
-    --output /tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_global_window_epoch1.pt \
-    --profile-output /tmp/vggt_fixed_pose_ft/profile_global_window_epoch1.json \
-    --teacher-cache-dir /app/outputs/teacher_cache/cache_global_w100_sub5_exhaustive \
+    --output /tmp/vggt_fixed_pose_ft/checkpoints/fixed_pose_student_tum_eth_mit_curriculum_epoch1.pt \
+    --profile-output /tmp/vggt_fixed_pose_ft/profile_tum_eth_mit_curriculum_epoch1.json \
+    --teacher-cache-dir /app/outputs/teacher_cache/cache_public_rgb_w100_windows_sub2_3_4_5_tokens \
+    --teacher-cache-dir /app/outputs/teacher_cache/cache_eth_cam0_w100_windows_sub2_3_4_5_tokens \
+    --teacher-cache-dir /app/outputs/teacher_cache/cache_mit_jpg_w100_windows_sub2_3_4_5_tokens \
     --image-resolution 512 \
     --epochs 1 \
     --batch-size 3 \
-    --lr 3e-6 \
+    --lr 8e-6 \
+    --curriculum-clip-lengths 2 3 4 5 \
+    --token-weight 0.1 \
+    --fixed-token-weight 1.0 \
+    --target-token-weight 1.0 \
+    --fixed-raw-pose-weight 1.0 \
     --freeze-backbone
 ```
 
-The fixed-pose SLAM runner commits locked poses in the model's native gauge, then
-exports a separately ground-normalized trajectory in `pose_enc` and `extrinsic`.
-This keeps fixed-pose conditioning aligned with training while preserving
-ground-normalized outputs for maps and diagnostics.
+`--batch-size` is implemented as gradient accumulation because the first
+fixed-pose SLAM state is batch-size 1 internally. The fixed-pose SLAM runner
+commits locked poses in the model's native gauge, then exports a separately
+ground-normalized trajectory in `pose_enc` and `extrinsic`; this keeps
+fixed-pose conditioning aligned with training while preserving useful map and
+trajectory outputs.
 
 ## Docker Compose
 
