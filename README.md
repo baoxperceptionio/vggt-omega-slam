@@ -1,4 +1,6 @@
-# VGGT-Omega SLAM with Ground-Tracking
+# VGGT-Omega SLAM (VO) with Ground-Tracking
+
+![VGGT-Omega SLAM technical figure](examples/VGGT-Omega-SLAM-technical-figure.png)
 
 This project is an experimental SLAM-style inference pipeline built on top of
 [VGGT-Omega](https://github.com/facebookresearch/vggt-omega). The original
