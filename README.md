@@ -41,44 +41,6 @@ ground-normalized global frame. Fine-tuning is therefore not required to use the
 current pipeline, although domain-specific data can still help if the input
 videos differ substantially from the checkpoint's training distribution.
 
-## Profiling: Full Sequence vs 4+1 Windows
-
-The practical reason for the wrapper is to avoid the time and memory growth of
-running one full-attention VGGT-Omega forward pass over a long clip. The table
-below profiles the released `VGGT-Omega-1B-512` checkpoint with the dense depth
-head enabled at `image_resolution=512` on an NVIDIA GH200. Inputs are the first
-`N` frames from `outputs/dji_0005_full_2fps/frames`. Images are preprocessed and
-moved to GPU before timing, so the numbers measure model forward time only.
-Peak memory is `torch.cuda.max_memory_allocated()` after resetting CUDA peak
-stats with the model already resident.
-
-`full` runs all `N` frames in one model call. `4+1` runs the first 5-frame
-window, then repeatedly runs a 5-frame window containing 4 previous frames plus
-one candidate frame. Total time is divided by `N` for the per-frame column.
-
-| Frames | Full peak GiB | 4+1 peak GiB | Memory reduction | Full s/frame | 4+1 s/frame | 4+1 speedup |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 8.17 | 7.81 | 1.05x | 0.0468 | 0.0792 | 0.59x |
-| 50 | 11.08 | 7.81 | 1.42x | 0.0342 | 0.0799 | 0.43x |
-| 100 | 14.72 | 7.81 | 1.88x | 0.0452 | 0.0802 | 0.56x |
-| 200 | 22.00 | 7.81 | 2.82x | 0.0728 | 0.0799 | 0.91x |
-| 300 | 29.28 | 7.81 | 3.75x | 0.1013 | 0.0799 | 1.27x |
-| 400 | 36.56 | 7.81 | 4.68x | 0.1290 | 0.0800 | 1.61x |
-| 500 | 43.84 | 7.81 | 5.61x | 0.1570 | 0.0800 | 1.96x |
-
-The tradeoff is visible: for short clips, one full forward pass is faster
-because it avoids repeated window setup. For longer clips, full attention grows
-in both memory and time, while 4+1 stays at a fixed window-level memory peak and
-becomes faster per input frame around this benchmark's 300-frame point.
-
-Reproduce the table:
-
-```bash
-python scripts/profile_full_vs_4plus1.py \
-  --counts 10 50 100 200 300 400 500 \
-  --output-dir outputs/profile_full_vs_4plus1
-```
-
 ## What Changed From VGGT-Omega
 
 VGGT-Omega is normally a batch model: it receives a set or short sequence of
@@ -251,17 +213,20 @@ python scripts/run_incremental_slam.py \
   --conf-percentile 20
 ```
 
-Common options:
+Arguments and common options:
 
 | Option | Meaning |
 | :--- | :--- |
+| `images` | Required input image files or glob patterns. Multiple paths or globs may be provided. |
 | `--checkpoint` | Path to the released VGGT-Omega checkpoint. |
+| `--output-dir` | Directory for `ground_tracking_slam_points.ply` and `ground_tracking_slam_predictions.npz`. |
 | `--window-size` | Number of frames per VGGT-Omega tracking window. The candidate frame is appended after the latest accepted anchors. |
 | `--displacement-threshold` | Minimum normalized translation required before a candidate is accepted into the map and future anchor set. |
 | `--image-resolution` | Preprocessing resolution passed to VGGT-Omega. Use `512` for the `VGGT-Omega-1B-512` checkpoint. |
 | `--conf-percentile` | Confidence percentile used when exporting the point cloud. |
 | `--max-points` | Maximum number of exported PLY points after filtering. |
 | `--device` | `cuda` or `cpu`. CUDA is expected for practical runs. |
+| `--allow-random-weights` | Run without a checkpoint for API smoke tests only. Output geometry is not meaningful. |
 
 Outputs:
 
